@@ -1,0 +1,181 @@
+name: "Whisper-Causal-Distil-CTC"
+init_from_nemo_model: ???
+seed: 42
+
+model:
+  sample_rate: 16000
+  compute_eval_loss: false # eval samples can be very long and exhaust memory. Disable computation of transducer loss during validation/testing with this flag.
+  log_prediction: true # enables logging sample predictions in the output during training
+  skip_nan_grad: false
+  use_cer: false
+
+  model_defaults:
+    enc_hidden: ${model.student.d_model}
+
+  train_ds:
+    manifest_filepath:    # Path to jsonl file containing the training data
+      - /localhome/local-ifu/streaming_asr/train_clean_100.json
+    sample_rate: ${model.sample_rate}
+    batch_size: 2 # you may increase batch_size if your memory allows. The actual batch size is determined by the number of GPUs and gradient accumulation steps: Actual batch size = batch_size * num_gpus * gradient_accumulation_steps
+    shuffle: true
+    num_workers: 16
+    pin_memory: true
+    max_duration: 30 # it is set for LibriSpeech, you may need to update it for your dataset
+    min_duration: 0.1
+    drop_last: true
+    audio_chunk_size: 30  # Optional: set to a fixed duration in seconds (e.g., 30.0) to pad all audio to this length
+    bucket_by: "audio"  # Bucket by 'audio' or 'text' length for efficient batching
+
+  validation_ds:
+    manifest_filepath: /localhome/local-ifu/streaming_asr/dev_clean.json
+    sample_rate: ${model.sample_rate}
+    batch_size: ${model.train_ds.batch_size}
+    shuffle: false
+    use_start_end_token: false
+    max_duration: ${model.train_ds.max_duration}
+    min_duration: ${model.train_ds.min_duration}
+    num_workers: 16
+    pin_memory: true
+    audio_chunk_size: 30
+    bucket_by: "audio"
+
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    batch_size: ${model.train_ds.batch_size}
+    max_duration: ${model.train_ds.max_duration}
+    min_duration: ${model.train_ds.min_duration}
+    shuffle: false
+    use_start_end_token: false
+    num_workers: 16
+    pin_memory: true
+
+  # You may find more detail on how to train a tokenizer at: /scripts/tokenizers/process_asr_text_tokenizer.py
+  tokenizer:
+    path: ???  # path to huggingface tokenizer directory
+    blank_token: "<|endoftext|>"
+
+  preprocessor:
+    _target_: src.extractor.WhisperMelExtractor
+    feature_size: 80
+    sampling_rate: 16000
+    hop_length: 160
+    chunk_length: 30
+    n_fft: 400
+    padding_value: 0.0
+    return_attention_mask: true
+
+  # Spectrogram augmentation is used to improve the robustness of the model to noise and other perturbations. Comment out if not needed.
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2 # set to zero to disable it
+    time_masks: 10 # set to zero to disable it
+    freq_width: 27
+    time_width: 0.05
+
+  teacher:
+    _target_: src.modules.transformer_encoder.WhisperEncoder
+    feat_in: ${model.preprocessor.feature_size}
+    n_layers: 32
+    d_model: 1280
+    ff_expansion_factor: 4
+    n_heads: 20  # Whisper-large has 20 attention heads
+    pos_emb_max_len: 1500
+    position_embedding_type: "learned"
+    gradient_checkpointing: false
+    freeze: true
+    freeze_ffn: false
+
+  student:
+    _target_: src.modules.transformer_encoder.WhisperEncoder
+    feat_in: ${model.preprocessor.feature_size}
+    n_layers: 32
+    d_model: 1280
+    ff_expansion_factor: 4
+    n_heads: 20
+    pos_emb_max_len: 1500
+    position_embedding_type: "alibi"
+    gradient_checkpointing: false
+    freeze: false
+    freeze_ffn: false
+
+  distil_loss:
+    type: "cosine"
+    reduction: "mean"
+    scale: 1000.0
+  # The section which would contain the decoder and decoding configs of the auxiliary CTC decoder
+  aux_ctc:
+    ctc_loss_weight: 0.3 # the weight used to combine the CTC loss with the distil loss
+    use_cer: false
+    decoder:
+      _target_: src.modules.projection.SimpleProj
+      feat_in: ${model.student.d_model}
+      num_classes: -1
+    decoding:
+      strategy: "greedy_batch"    # "greedy", "greedy_batch", "beam", "pyctcdecode", "flashlight", "wfst", 
+
+  # config for InterCTC loss: https://arxiv.org/abs/2102.03216
+  # specify loss weights and which layers to use for InterCTC
+  # e.g., to reproduce the paper results, set loss_weights: [0.3]
+  # and apply_at_layers: [8] (assuming 18 layers). Note that final
+  # layer loss coefficient is automatically adjusted (to 0.7 in above example)
+  interctc:
+    loss_weights: []
+    apply_at_layers: []
+
+  optim:
+    name: adamw
+    lr: 1e-3
+    eps: 1e-06
+    # optimizer arguments
+    betas: [ 0.9, 0.98 ]
+    weight_decay: 1e-3
+
+    # scheduler setup
+    sched:
+      name: CosineAnnealing
+      max_steps: 1000000
+      min_lr: 1e-6
+      # Scheduler params
+      warmup_steps: 5000
+      warmup_ratio: null
+
+trainer:
+  devices: 1 # number of GPUs, -1 would use all available GPUs
+  num_nodes: 1
+  max_epochs: 500
+  max_steps: -1 # computed at runtime if not set
+  val_check_interval: 1.0 # Set to 0.25 to check 4 times per epoch, or an int for number of iterations
+  accelerator: auto
+  strategy: ddp
+  accumulate_grad_batches: 8
+  gradient_clip_val: 1.0
+  precision: bf16 # 16, 32, or bf16. Strongly recommended to use bf16 for training. fp16 might cause numerical instability.
+  log_every_n_steps: 500  # Interval of logging.
+  enable_progress_bar: True
+  num_sanity_val_steps: 0 # number of steps to perform validation steps for sanity check the validation process before starting the training, setting to 0 disables it
+  check_val_every_n_epoch: 1 # number of evaluations on validation every n epochs
+  sync_batchnorm: true
+  enable_checkpointing: false  # Provided by exp_manager
+  logger: false  # Provided by exp_manager
+  benchmark: false # needs to be false for models with variable-length speech input as it slows down training
+
+
+exp_manager:
+  exp_dir: "exp"
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    # in case of multiple validation sets, first one is used
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 5
+    always_save_nemo: True # saves the checkpoints as nemo files instead of PTL checkpoints
+  resume_if_exists: True
+  resume_ignore_no_checkpoint: True
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: null
+    project: null
