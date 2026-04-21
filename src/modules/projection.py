@@ -5,8 +5,11 @@ from nemo.collections.asr.modules.rnnt import RNNTJoint
 from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.module import NeuralModule
 from nemo.collections.asr.parts.submodules.jasper import init_weights
-
-import k2
+from nemo.utils import logging
+try:
+    import k2
+except ImportError:
+    logging.warning("k2 is not installed, RNN-T training will be disabled")
 
 class SimpleProj(NeuralModule, Exportable):
     def __init__(self, feat_in, num_classes, init_mode="xavier_uniform", vocabulary=None, tie_weights=False):
