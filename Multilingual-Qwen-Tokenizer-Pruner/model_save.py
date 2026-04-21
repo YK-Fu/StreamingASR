@@ -35,7 +35,7 @@ def saving_updated_qwenvl(old_model, new_vocab_size, token_mapping, output_path)
     """Save updated Qwen-VL model with new vocabulary."""
     embed_layer, lm_head, model_type = get_embed_and_lm_head(old_model)
     
-    # Define new modules
+    # Define new modules (extra special tokens beyond token_mapping get random init)
     new_embeds = torch.nn.Embedding(
         new_vocab_size, 
         old_model.config.hidden_size, 
@@ -48,11 +48,13 @@ def saving_updated_qwenvl(old_model, new_vocab_size, token_mapping, output_path)
         dtype=lm_head.weight.dtype
     )
     
-    # Get new module parameters from the old
-    assert len(set(token_mapping)) == new_vocab_size
+    num_mapped = len(token_mapping)
+    assert len(set(token_mapping)) == num_mapped
     mapping_tensor = torch.LongTensor(token_mapping).to(old_model.device)
-    new_embeds.weight.data = embed_layer.weight.data[mapping_tensor]
-    new_lm_head.weight.data = lm_head.weight.data[mapping_tensor]
+    new_embeds.weight.data[:num_mapped] = embed_layer.weight.data[mapping_tensor]
+    new_lm_head.weight.data[:num_mapped] = lm_head.weight.data[mapping_tensor]
+    if new_vocab_size > num_mapped:
+        print(f"  {new_vocab_size - num_mapped} extra special token(s) randomly initialized")
     
     # Update model weights
     if model_type == 'qwen2':
@@ -90,7 +92,7 @@ def saving_updated_qwen(old_model, new_vocab_size, token_mapping, output_path):
     
     print(f"Detected model architecture: {model_type}")
     
-    # Define new modules
+    # Define new modules (extra special tokens beyond token_mapping get random init)
     new_embeds = torch.nn.Embedding(
         new_vocab_size, 
         old_model.config.hidden_size, 
@@ -103,13 +105,15 @@ def saving_updated_qwen(old_model, new_vocab_size, token_mapping, output_path):
         dtype=lm_head.weight.dtype
     )
     
-    # Get new module parameters from the old
-    assert len(set(token_mapping)) == new_vocab_size, \
-        f"Mapping has duplicates: {len(set(token_mapping))} unique vs {new_vocab_size} expected"
+    num_mapped = len(token_mapping)
+    assert len(set(token_mapping)) == num_mapped, \
+        f"Mapping has duplicates: {len(set(token_mapping))} unique vs {num_mapped} expected"
     
     mapping_tensor = torch.LongTensor(token_mapping).to(old_model.device)
-    new_embeds.weight.data = embed_layer.weight.data[mapping_tensor]
-    new_lm_head.weight.data = lm_head.weight.data[mapping_tensor]
+    new_embeds.weight.data[:num_mapped] = embed_layer.weight.data[mapping_tensor]
+    new_lm_head.weight.data[:num_mapped] = lm_head.weight.data[mapping_tensor]
+    if new_vocab_size > num_mapped:
+        print(f"  {new_vocab_size - num_mapped} extra special token(s) randomly initialized")
     
     # Update model weights based on architecture
     if model_type == 'qwen2':

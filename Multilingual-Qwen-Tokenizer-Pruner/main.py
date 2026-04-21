@@ -11,7 +11,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from vocab_count import count_freq, count_recursive_parallel
-from vocab_save import get_new_vocab_and_map, save_vocab, reduce_to_target_size, filter_long_tokens
+from vocab_save import get_new_vocab_and_map, save_vocab, reduce_to_target_size, filter_long_tokens, filter_multichar_cjk_tokens
 from model_save import saving_updated_qwen, saving_updated_qwenvl
 from utils import load_vocabulary_bytes
 
@@ -41,6 +41,10 @@ def main():
                         help='Max tokens per text (default: 8192)')
     parser.add_argument('--max_token_length', type=int, default=None,
                         help='Filter out tokens with more than N bytes/characters (e.g., 10)')
+    parser.add_argument('--filter_multichar_cjk', action='store_true',
+                        help='Remove CJK tokens longer than 1 character (keep only single-char CJK)')
+    parser.add_argument('--add_special_tokens', type=str, default=None,
+                        help='Path to text file with new special tokens to add (one per line)')
     args = parser.parse_args()
     
     # Validate: need at least one source of vocabulary counts
@@ -112,6 +116,15 @@ def main():
             max_length=args.max_token_length
         )
     
+    # Filter multi-character CJK tokens if requested
+    if args.filter_multichar_cjk:
+        print(f"==> Filtering multi-character CJK tokens")
+        vocab_counts, recur_counts, _ = filter_multichar_cjk_tokens(
+            vocab_counts=vocab_counts,
+            recur_counts=recur_counts,
+            old_bytes_list=old_bytes_list
+        )
+
     # Reduce vocab to target size if specified
     if args.target_size is not None:
         print(f"==> Reducing vocab to target size: {args.target_size:,}")
@@ -123,6 +136,13 @@ def main():
             old_bytes_list=old_bytes_list
         )
     
+    # Read extra special tokens file if provided
+    extra_special_tokens = []
+    if args.add_special_tokens is not None:
+        with open(args.add_special_tokens, 'r', encoding='utf-8') as f:
+            extra_special_tokens = [line.strip() for line in f if line.strip()]
+        print(f"==> Will add {len(extra_special_tokens)} extra special tokens from {args.add_special_tokens}")
+
     # Get new vocabulary and mapping
     print(f"==> Building new vocabulary")
     new_bytes_list, mapping_new2old = get_new_vocab_and_map(
@@ -133,7 +153,7 @@ def main():
         old_tokenizer=old_tokenizer,
         only_essential_special_tokens=True  # Only BOS, EOS, PAD
     )
-    new_vocab_size = len(mapping_new2old)
+    new_vocab_size = len(mapping_new2old) + len(extra_special_tokens)
     
     # Save vocabulary files
     save_vocab(
@@ -141,7 +161,8 @@ def main():
         mapping_new2old, 
         args.new_model_path, 
         tokenizer_format=tokenizer_format, 
-        old_tokenizer=old_tokenizer
+        old_tokenizer=old_tokenizer,
+        extra_special_tokens=extra_special_tokens
     )
 
     # Update and save model checkpoint
@@ -157,6 +178,8 @@ def main():
     print(f"Vocabulary pruning complete!")
     print(f"  Original size: {old_vocab_size:,}")
     print(f"  New size:      {new_vocab_size:,}")
+    if extra_special_tokens:
+        print(f"    (includes {len(extra_special_tokens)} extra special tokens)")
     print(f"  Reduction:     {old_vocab_size - new_vocab_size:,} tokens ({100*(old_vocab_size-new_vocab_size)/old_vocab_size:.1f}%)")
     print(f"  Output path:   {args.new_model_path}")
     print(f"{'='*50}")
