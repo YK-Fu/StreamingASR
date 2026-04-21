@@ -166,6 +166,8 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             manifest_filepath=config.manifest_filepath,
             tokenizer=self.tokenizer,
             batch_size=config['batch_size'],
+            language_mapping=self.encoder.language_mapping,
+            language_drop_rate=config.get('language_drop_rate', 0.0),
             sample_rate=config['sample_rate'],
             max_duration=config['max_duration'],
             min_duration=config['min_duration'],
@@ -279,14 +281,14 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         if self.is_interctc_enabled():
             AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
 
-        context, target, attn_mask, position_ids, target_start, target_end, waveform = batch
+        context, target, attn_mask, position_ids, target_start, target_end, waveform, language_ids = batch
 
         # Do not pass length to the preprocessor, it will be computed in the preprocessor (padding as blank training)
         signal, signal_length = self.preprocessor(raw_speech=waveform, length=None)
         if self.spec_augmentation is not None and self.training:
             signal = self.spec_augmentation(input_spec=signal, length=signal_length)
         # forward() only performs encoder forward
-        encoded = self.forward(input_signal=signal)
+        encoded = self.forward(input_signal=signal, language_ids=language_ids)
         encoded_len = torch.full((encoded.shape[0],), encoded.shape[2], device=encoded.device)
 
         if self.ctc_loss_weight > 0:
@@ -403,9 +405,9 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         return encoded
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        context, target, attn_mask, position_ids, target_start, target_end, signal = batch
+        context, target, attn_mask, position_ids, target_start, target_end, signal, language_ids = batch
         signal, _ = self.preprocessor(raw_speech=signal, length=None)
-        encoded = self.forward(input_signal=signal)
+        encoded = self.forward(input_signal=signal, language_ids=language_ids)
         encoded_len = torch.full((encoded.shape[0],), encoded.shape[2], device=encoded.device)
 
         tensorboard_logs = {}

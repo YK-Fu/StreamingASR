@@ -16,6 +16,10 @@ model:
     manifest_filepath:    # Path to jsonl file containing the training data
       - /localhome/local-ifu/streaming_asr/train_clean_100.json
     sample_rate: ${model.sample_rate}
+    language_drop_rate: 0.2
+    language_file: ${model.student.language_file}
+    never_drop_language:
+      - <|ZH_SIM|>
     batch_size: 2 # you may increase batch_size if your memory allows. The actual batch size is determined by the number of GPUs and gradient accumulation steps: Actual batch size = batch_size * num_gpus * gradient_accumulation_steps
     shuffle: true
     num_workers: 16
@@ -29,6 +33,7 @@ model:
   validation_ds:
     manifest_filepath: /localhome/local-ifu/streaming_asr/dev_clean.json
     sample_rate: ${model.sample_rate}
+    language_file: ${model.student.language_file}
     batch_size: ${model.train_ds.batch_size}
     shuffle: false
     use_start_end_token: false
@@ -42,6 +47,7 @@ model:
   test_ds:
     manifest_filepath: null
     sample_rate: ${model.sample_rate}
+    language_file: ${model.student.language_file}
     batch_size: ${model.train_ds.batch_size}
     max_duration: ${model.train_ds.max_duration}
     min_duration: ${model.train_ds.min_duration}
@@ -89,6 +95,7 @@ model:
   student:
     _target_: src.modules.transformer_encoder.WhisperEncoder
     feat_in: ${model.preprocessor.feature_size}
+    language_file: ???
     n_layers: 32
     d_model: 1280
     ff_expansion_factor: 4
@@ -106,7 +113,7 @@ model:
   # The section which would contain the decoder and decoding configs of the auxiliary CTC decoder
   aux_ctc:
     ctc_loss_weight: 0.3 # the weight used to combine the CTC loss with the distil loss
-    use_cer: false
+    use_cer: true
     decoder:
       _target_: src.modules.projection.SimpleProj
       feat_in: ${model.student.d_model}
@@ -168,7 +175,7 @@ exp_manager:
   create_checkpoint_callback: true
   checkpoint_callback_params:
     # in case of multiple validation sets, first one is used
-    monitor: "val_wer"
+    monitor: "val_wer_ctc"
     mode: "min"
     save_top_k: 5
     always_save_nemo: True # saves the checkpoints as nemo files instead of PTL checkpoints

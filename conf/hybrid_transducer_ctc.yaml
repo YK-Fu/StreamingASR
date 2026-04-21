@@ -78,6 +78,7 @@ model:
   encoder:
     _target_: src.modules.transformer_encoder.WhisperEncoder
     feat_in: ${model.preprocessor.feature_size}
+    language_files: ???
     n_layers: 32
     d_model: 1280
     ff_expansion_factor: 4
@@ -145,7 +146,7 @@ model:
   # The section which would contain the decoder and decoding configs of the auxiliary CTC decoder
   aux_ctc:
     ctc_loss_weight: 0.2 # the weight used to combine the CTC loss with the RNNT loss
-    use_cer: false
+    use_cer: true
     decoder:
       _target_: src.modules.projection.SimpleProj
       feat_in: ${model.encoder.d_model}

@@ -24,6 +24,7 @@ from nemo.core.classes.mixins import AccessMixin
 from nemo.core.classes.module import NeuralModule
 from nemo.core.neural_types import (
     AcousticEncodedRepresentation,
+    LabelsType,
     StringType,
     NeuralType,
     SpectrogramType,
@@ -53,6 +54,7 @@ class WhisperEncoder(NeuralModule, AccessMixin):
         return OrderedDict(
             {
                 "audio_signal": NeuralType(('B', 'D', 'T'), SpectrogramType()),
+                "language_ids": NeuralType(('B',), LabelsType(), optional=True),
                 "mode": NeuralType(tuple(), StringType(), optional=True),
             }
         )
@@ -74,6 +76,7 @@ class WhisperEncoder(NeuralModule, AccessMixin):
         d_model,
         ff_expansion_factor=4,
         n_heads=4,
+        language_file=None,
         pos_emb_max_len=5000,
         use_bias=True,
         dropout=0.1,
@@ -119,6 +122,14 @@ class WhisperEncoder(NeuralModule, AccessMixin):
         self.n_layers = n_layers
         self._feat_in = feat_in
         self.subsampling_factor = 2
+        if language_file is not None:
+            self.language_mapping = {}
+            with open(language_file, 'r') as f:
+                for i, language in enumerate(f):
+                    language = language.strip()
+                    self.language_mapping[language] = i
+        else:
+            self.language_mapping = None
 
         self.gradient_checkpointing = gradient_checkpointing
         # Subsampling
@@ -129,6 +140,11 @@ class WhisperEncoder(NeuralModule, AccessMixin):
             nn.GELU(),
             nn.Dropout(dropout_pre_encoder),
         )
+        if self.language_mapping is not None:
+            self.language_embedding = nn.Embedding(len(self.language_mapping), d_model)
+        else:
+            self.language_embedding = None
+
         self.max_audio_length = pos_emb_max_len
         # Positional encodings
         if position_embedding_type == "learned":
@@ -168,6 +184,7 @@ class WhisperEncoder(NeuralModule, AccessMixin):
     def forward(
         self,
         audio_signal,
+        language_ids=None,
         cache=None,
         mode='asr',
     ):
@@ -179,7 +196,7 @@ class WhisperEncoder(NeuralModule, AccessMixin):
         """
         
         if mode == 'asr':
-            return self.forward_internal(audio_signal, cache=cache)
+            return self.forward_internal(audio_signal, language_ids=language_ids, cache=cache)
         elif mode == 'teacher':
             return self.forward_teacher(audio_signal)
         else:
@@ -201,6 +218,7 @@ class WhisperEncoder(NeuralModule, AccessMixin):
     def forward_internal(
         self,
         audio_signal,
+        language_ids=None,
         cache=None,
     ):
         audio_signal = self.pre_encode(audio_signal)
@@ -210,6 +228,10 @@ class WhisperEncoder(NeuralModule, AccessMixin):
             position_ids = torch.arange(0, audio_signal.size(1), device=audio_signal.device)
             pos_emb = self.pos_enc(position_ids)
             audio_signal = audio_signal + self.pos_dropout(pos_emb)
+
+        if self.language_embedding is not None:
+            language_emb = self.language_embedding(language_ids).unsqueeze(1)
+            audio_signal = audio_signal + language_emb
 
         for lth, layer in enumerate(self.layers):
             if cache is not None:

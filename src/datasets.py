@@ -63,6 +63,9 @@ class ASRDataset(Dataset):
         manifest_filepath: str,
         tokenizer,
         sample_rate: int = 16000,
+        language_mapping: dict[str, int] = None,
+        language_drop_rate: float = 0.0,
+        never_drop_language: List[str] = [],
         batch_size: int = 16,
         max_duration: Optional[float] = None,
         min_duration: Optional[float] = None,
@@ -73,6 +76,9 @@ class ASRDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.sample_rate = sample_rate
+        self.language_mapping = language_mapping
+        self.language_drop_rate = language_drop_rate
+        self.never_drop_language = set(never_drop_language)
         self.max_duration = max_duration if max_duration is not None else float('inf')
         self.min_duration = min_duration if min_duration is not None else 0
         self.audio_chunk_size = int(audio_chunk_size * sample_rate) if audio_chunk_size is not None else None
@@ -134,12 +140,19 @@ class ASRDataset(Dataset):
         # Convert to mono if stereo
         if waveform.dim() > 1:
             waveform = waveform.mean(dim=0)
+        # Drop language with probability language_drop_rate
+        language = item.get('language', '<|NO_LANGUAGE_ID|>')
+        if random.random() < self.language_drop_rate and language not in self.never_drop_language:
+            language = '<|NO_LANGUAGE_ID|>'
+            
+        context_tokens = [self.tokenizer.bos_id]
+        context_tokens.append(self.tokenizer.token_to_id(language))
+        if self.language_mapping is not None:
+            language_id = self.language_mapping[language]
 
         # Tokenize context and transcription separately to track indices
         if context:    
-            context_tokens = [self.tokenizer.bos_id] + self.tokenizer.text_to_ids(context)
-        else:
-            context_tokens = [self.tokenizer.bos_id]
+            context_tokens = context_tokens + self.tokenizer.text_to_ids(context)
         
         transcription_tokens = self.tokenizer.text_to_ids(transcription)
         
@@ -156,6 +169,7 @@ class ASRDataset(Dataset):
             'target': torch.tensor(transcription_tokens, dtype=torch.long),
             'target_start': target_start,
             'target_end': target_end,
+            'language_id': language_id,
         }
     
     def collate_fn(self, batch):
@@ -173,7 +187,7 @@ class ASRDataset(Dataset):
         target_list = [item['target'] for item in batch]
         target_starts = torch.tensor([item['target_start'] for item in batch], dtype=torch.long)
         target_ends = torch.tensor([item['target_end'] for item in batch], dtype=torch.long)
-
+        language_ids = torch.tensor([item['language_id'] for item in batch], dtype=torch.long)
         # Pad to longest in batch or to fixed audio_chunk_size
         waveforms = pad_list_of_tensors(waveforms, pad_value=0, max_length=self.audio_chunk_size)
         context = pad_list_of_tensors(context_list, pad_value=self.tokenizer.pad_id)
@@ -188,7 +202,7 @@ class ASRDataset(Dataset):
         batch_size, seq_len = attn_mask.shape
         position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1).clone()
 
-        return context, target, attn_mask, position_ids, target_starts, target_ends, waveforms
+        return context, target, attn_mask, position_ids, target_starts, target_ends, waveforms, language_ids
 
 class ResumableDataloader(DataLoader):
     def state_dict(self):
@@ -243,6 +257,9 @@ def get_asr_dataset(
     tokenizer,
     batch_size: int = 16,
     sample_rate: int = 16000,
+    language_file: str = "",
+    language_drop_rate: float = 0.0,
+    never_drop_language: List[str] = [],
     max_duration: Optional[float] = None,
     min_duration: Optional[float] = None,
     audio_chunk_size: Optional[float] = None,
@@ -260,11 +277,18 @@ def get_asr_dataset(
     # Handle empty list
     if len(manifest_filepath) == 0:
         return None
-    
+    if language_file:
+        with open(language_file, 'r') as f:
+            language_mapping = {language.strip(): i for i, language in enumerate(f)}
+    else:
+        language_mapping = None
     return ASRDataset(
         manifest_filepath=manifest_filepath,
         tokenizer=tokenizer,
         sample_rate=sample_rate,
+        language_mapping=language_mapping,
+        language_drop_rate=language_drop_rate,
+        never_drop_language=never_drop_language,
         batch_size=batch_size,
         max_duration=max_duration,
         min_duration=min_duration,

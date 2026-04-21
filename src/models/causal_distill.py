@@ -145,6 +145,9 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             bucket_by=config.get('bucket_by', 'audio'),
             audio_chunk_size=config.get('audio_chunk_size', None),
             drop_last=config.get('drop_last', True),
+            language_file=config.get('language_file', ""),
+            language_drop_rate=config.get('language_drop_rate', 0.0),
+            never_drop_language=config.get('never_drop_language', []),
         )
         if dataset is None:
             return None
@@ -173,7 +176,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         if self.is_interctc_enabled():
             AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
 
-        _, target, _, _, target_start, target_end, waveform = batch
+        _, target, _, _, target_start, target_end, waveform, language_id = batch
         target_len = target_end - target_start
 
         # Do not pass length to the preprocessor, it will be computed in the preprocessor (padding as blank training)
@@ -184,7 +187,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         else:
             student_signal = teacher_signal = signal
         # forward() only performs encoder forward
-        student_encoded = self.forward(input_signal=student_signal)
+        student_encoded = self.forward(input_signal=student_signal, language_ids=language_id)
         teacher_encoded = self.forward(input_signal=teacher_signal, mode='teacher')
         encoded_len = torch.full((student_encoded.shape[0],), student_encoded.shape[2], device=student_encoded.device)
 
@@ -247,20 +250,26 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
 
         return {'loss': loss_value}
 
-    def forward(self, input_signal, mode='student'):
+    def forward(self, input_signal, language_ids=None, mode='student'):
         if mode == 'student':
-            encoded = self.student(audio_signal=input_signal)
+            encoded = self.student(audio_signal=input_signal, language_ids=language_ids)
         elif mode == 'teacher':
             encoded = self.teacher(audio_signal=input_signal, mode='teacher')
         else:
             raise ValueError(f"Invalid mode: {mode}")
         return encoded
 
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        logs = self.validation_pass(batch, batch_idx, dataloader_idx)
+        self.log_dict(logs, sync_dist=True)
+        return logs
+
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        _, target, _, _, target_start, target_end, waveform = batch
+        _, target, _, _, target_start, target_end, waveform, language_ids = batch
         target_len = target_end - target_start
-        student_encoded = self.forward(input_signal=waveform)
-        teacher_encoded = self.forward(input_signal=waveform, mode='teacher')
+        signal, _ = self.preprocessor(raw_speech=waveform, length=None)
+        student_encoded = self.forward(input_signal=signal, language_ids=language_ids)
+        teacher_encoded = self.forward(input_signal=signal, mode='teacher')
         encoded_len = torch.full((student_encoded.shape[0],), student_encoded.shape[2], device=student_encoded.device)
 
         tensorboard_logs = {}
