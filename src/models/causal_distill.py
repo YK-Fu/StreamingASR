@@ -244,7 +244,6 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
 
         # Log items
         self.log_dict(tensorboard_logs)
-        breakpoint()
 
         return {'loss': loss_value}
 
