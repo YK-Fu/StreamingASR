@@ -1,0 +1,19 @@
+# Dependencies for src/modules/evaluation.py (MixErrorRate / MixErrorRateMetric)
+# Install on top of your existing training env:
+#     pip install -r requirements-eval.txt
+
+# Chinese / English / mixed text processing
+opencc                 # simplified <-> traditional Chinese
+pypinyin               # pinyin / bopomofo (phonemize mode)
+g2p-en                 # English grapheme-to-phoneme (phonemize mode)
+
+# Edit-distance backends
+editdistance           # used by compute() / compute_num_denom()
+edit_distance          # different package; SequenceMatcher used by cal_single_complete_mer()
+
+# Misc
+tqdm
+
+# Already pulled in by NeMo / PyTorch Lightning, listed for completeness
+torch
+torchmetrics
