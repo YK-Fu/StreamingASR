@@ -243,10 +243,11 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             # token-counting rule as val_wer_ctc, so the two numbers are directly
             # comparable. Only runs every log_every_n_steps (compute_wer gate).
             if compute_wer:
-                pred_strs, _ = self.ctc_decoding.ctc_decoder_predictions_tensor(
+                pred_hyps, _ = self.ctc_decoding.ctc_decoder_predictions_tensor(
                     decoder_outputs=ctc_output,
                     decoder_lengths=encoded_len,
                 )
+                pred_strs = [h.text if hasattr(h, 'text') else h for h in pred_hyps]
                 ref_strs = [
                     self.tokenizer.ids_to_text(t[:l].tolist())
                     for t, l in zip(target, target_len)
@@ -331,10 +332,11 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         #     directly from compute_num_denom (no DDP sync). It is just for
         #     progress visibility — it is mathematically a per-batch ratio,
         #     not the micro-average. Use val_wer_ctc as the canonical metric.
-        pred_strs, _ = self.ctc_decoding.ctc_decoder_predictions_tensor(
+        pred_hyps, _ = self.ctc_decoding.ctc_decoder_predictions_tensor(
             decoder_outputs=ctc_output,
             decoder_lengths=encoded_len,
         )
+        pred_strs = [h.text if hasattr(h, 'text') else h for h in pred_hyps]
         ref_strs = [
             self.tokenizer.ids_to_text(t[:l].tolist())
             for t, l in zip(target, target_len)
