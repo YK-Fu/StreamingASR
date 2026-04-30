@@ -39,6 +39,8 @@ from nemo.utils.model_utils import maybe_update_config_version
 from src.loss import CTCLoss, CosineSimilarityLoss, MSELoss
 from src.decoding_utils import CTCDecoding
 from src.datasets import get_asr_dataset, ResumableDataloader, ResumableSampler
+from src.modules.evaluation import MixErrorRate, MixErrorRateMetric
+
 
 class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
     """Base class for encoder decoder RNNT-based models with auxiliary CTC decoder/loss and subword tokenization."""
@@ -128,6 +130,17 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             dist_sync_on_step=True,
             log_prediction=self.cfg.get("log_prediction", False),
         )
+
+        # ************** 0429, Forbes: Setup MER for evaluation (DDP-safe) **************
+        # MixErrorRate handles Chinese / English / code-switched references
+        # (Chinese counted by character, English by word). MixErrorRateMetric
+        # wraps it as a torchmetrics.Metric so its err / nref states are
+        # all-reduced (sum) across ranks at compute() time, giving a true
+        # micro-averaged MER instead of an average of per-batch ratios.
+        self.mer_metric = MixErrorRate(to_simplified_chinese=True)
+        self.ctc_mer = MixErrorRateMetric(self.mer_metric, dist_sync_on_step=False)
+        # **********************************************************************
+
 
         # Setup optional Optimization flags
         self.setup_optimization_flags()
@@ -224,16 +237,28 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             )
             tensorboard_logs.update({'train_ctc_loss': ctc_loss.detach().cpu().item()})
             loss_value = (1 - self.ctc_loss_weight) * distil_loss + self.ctc_loss_weight * ctc_loss
+            # ************** 0429, Forbes: training-time MER instead of WER **************
+            # Per-batch local-rank MER via compute_num_denom (no DDP sync — this
+            # is just trend monitoring during training, not the final eval). Same
+            # token-counting rule as val_wer_ctc, so the two numbers are directly
+            # comparable. Only runs every log_every_n_steps (compute_wer gate).
             if compute_wer:
-                self.ctc_wer.update(
-                    predictions=ctc_output, 
-                    predictions_lengths=encoded_len,
-                    targets=target, 
-                    targets_lengths=target_len,
+                pred_result = self.ctc_decoding.ctc_decoder_predictions_tensor(
+                    decoder_outputs=ctc_output,
+                    decoder_lengths=encoded_len,
                 )
-                ctc_wer, _, _ = self.ctc_wer.compute()
-                self.ctc_wer.reset()
-                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer})
+                pred_hyps = pred_result[0] if isinstance(pred_result, tuple) else pred_result
+                pred_strs = [h.text if hasattr(h, 'text') else h for h in pred_hyps]
+                ref_strs = [
+                    self.tokenizer.ids_to_text(t[:l].tolist())
+                    for t, l in zip(target, target_len)
+                ]
+                ctc_err, ctc_nref = self.mer_metric.compute_num_denom(
+                    predictions=pred_strs, references=ref_strs,
+                )
+                if ctc_nref > 0:
+                    tensorboard_logs.update({'training_batch_wer_ctc': ctc_err / ctc_nref})
+            # **********************************************************************
         else:
             loss_value = distil_loss
 
@@ -262,6 +287,16 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         logs = self.validation_pass(batch, batch_idx, dataloader_idx)
         self.log_dict(logs, sync_dist=True)
+        # ************** 0429, Forbes: surface per-batch MER on the tqdm bar **************
+        # Logged separately from log_dict to use prog_bar=True and on_epoch=False.
+        # The value is stashed in self._val_batch_mer by validation_pass to
+        # avoid double-logging the same key with different arguments.
+        if getattr(self, '_val_batch_mer', None) is not None:
+            self.log(
+                'val_batch_wer_ctc', self._val_batch_mer,
+                prog_bar=True, on_step=True, on_epoch=False, sync_dist=False,
+            )
+        # **********************************************************************
         return logs
 
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
@@ -286,22 +321,62 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         else:
             ctc_output = self.ctc_decoder(student_encoded, return_logits=False, return_softmax=True)
 
-        self.ctc_wer.update(
-            predictions=ctc_output,
-            targets=target,
-            targets_lengths=target_len,
-            predictions_lengths=encoded_len,
+
+
+        # ************** 0429, Forbes: Mixed Error Rate (MER) instead of WER for evaluation **************
+        # Two MER values are produced from the same decoded strings:
+        #   * self.ctc_mer.update(...) accumulates err / nref into the metric
+        #     state. compute() is called once per epoch in
+        #     on_validation_epoch_end and returns the canonical, micro-averaged,
+        #     DDP-synchronised val_wer_ctc.
+        #   * val_batch_wer_ctc is the per-batch local-rank MER, computed
+        #     directly from compute_num_denom (no DDP sync). It is just for
+        #     progress visibility — it is mathematically a per-batch ratio,
+        #     not the micro-average. Use val_wer_ctc as the canonical metric.
+        pred_result = self.ctc_decoding.ctc_decoder_predictions_tensor(
+            decoder_outputs=ctc_output,
+            decoder_lengths=encoded_len,
         )
-        ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
-        self.ctc_wer.reset()
-        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num
-        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom
-        tensorboard_logs['val_wer_ctc'] = ctc_wer
+        pred_hyps = pred_result[0] if isinstance(pred_result, tuple) else pred_result
+        pred_strs = [h.text if hasattr(h, 'text') else h for h in pred_hyps]
+        ref_strs = [
+            self.tokenizer.ids_to_text(t[:l].tolist())
+            for t, l in zip(target, target_len)
+        ]
+        # ************** 0429, Forbes: TEMP debug — remove after MER sanity-check **************
+        if batch_idx < 2 and self.global_rank == 0:
+            print(f"\n[batch {batch_idx}] pred[0]: {pred_strs[0][:200]!r}")
+            print(f"[batch {batch_idx}] ref[0]:  {ref_strs[0][:200]!r}")
+            print(f"[batch {batch_idx}] pred_len={len(pred_strs[0])}, ref_len={len(ref_strs[0])}")
+        # **********************************************************************
+        self.ctc_mer.update(predictions=pred_strs, references=ref_strs)
+        batch_err, batch_nref = self.mer_metric.compute_num_denom(
+            predictions=pred_strs, references=ref_strs,
+        )
+        # store for validation_step to log once (avoids double-log via log_dict)
+        self._val_batch_mer = (batch_err / batch_nref) if batch_nref > 0 else None
+        # **********************************************************************
         tensorboard_logs['global_step'] = self.trainer.global_step
 
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
         return tensorboard_logs
+
+    def on_validation_epoch_end(self):
+        # ************** 0429, Forbes: epoch-level MER aggregation (DDP-safe) **************
+        # compute() triggers an all-reduce sum on err / nref across ranks,
+        # so every rank sees the same micro-averaged MER. We then log once
+        # with sync_dist=False (already synchronized).
+        mer, err, nref = self.ctc_mer.compute()
+        if int(nref.item()) > 0:
+            self.log('val_wer_ctc',       mer,                            sync_dist=False, prog_bar=True)
+            self.log('val_wer_num_ctc',   err.to(torch.float32),          sync_dist=False)
+            self.log('val_wer_denom_ctc', nref.to(torch.float32),         sync_dist=False)
+        self.ctc_mer.reset()
+        # **********************************************************************
+        parent = getattr(super(), 'on_validation_epoch_end', None)
+        if callable(parent):
+            return parent()
 
     def setup_training_data(self, train_data_config: Optional[Union[DictConfig, Dict]]):
         if 'shuffle' not in train_data_config:
