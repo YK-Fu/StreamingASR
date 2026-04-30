@@ -288,12 +288,12 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         logs = self.validation_pass(batch, batch_idx, dataloader_idx)
         self.log_dict(logs, sync_dist=True)
         # ************** 0429, Forbes: surface per-batch MER on the tqdm bar **************
-        # Lets you watch val_batch_wer_ctc tick down per step on long val sets,
-        # while val_wer_ctc (epoch-level micro-average) remains the canonical
-        # number logged in on_validation_epoch_end.
-        if 'val_batch_wer_ctc' in logs:
+        # Logged separately from log_dict to use prog_bar=True and on_epoch=False.
+        # The value is stashed in self._val_batch_mer by validation_pass to
+        # avoid double-logging the same key with different arguments.
+        if getattr(self, '_val_batch_mer', None) is not None:
             self.log(
-                'val_batch_wer_ctc', logs['val_batch_wer_ctc'],
+                'val_batch_wer_ctc', self._val_batch_mer,
                 prog_bar=True, on_step=True, on_epoch=False, sync_dist=False,
             )
         # **********************************************************************
@@ -347,8 +347,8 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         batch_err, batch_nref = self.mer_metric.compute_num_denom(
             predictions=pred_strs, references=ref_strs,
         )
-        if batch_nref > 0:
-            tensorboard_logs['val_batch_wer_ctc'] = batch_err / batch_nref
+        # store for validation_step to log once (avoids double-log via log_dict)
+        self._val_batch_mer = (batch_err / batch_nref) if batch_nref > 0 else None
         # **********************************************************************
         tensorboard_logs['global_step'] = self.trainer.global_step
 
