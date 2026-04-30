@@ -343,6 +343,12 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             self.tokenizer.ids_to_text(t[:l].tolist())
             for t, l in zip(target, target_len)
         ]
+        # ************** 0429, Forbes: TEMP debug — remove after MER sanity-check **************
+        if batch_idx < 2 and self.global_rank == 0:
+            print(f"\n[batch {batch_idx}] pred[0]: {pred_strs[0][:200]!r}")
+            print(f"[batch {batch_idx}] ref[0]:  {ref_strs[0][:200]!r}")
+            print(f"[batch {batch_idx}] pred_len={len(pred_strs[0])}, ref_len={len(ref_strs[0])}")
+        # **********************************************************************
         self.ctc_mer.update(predictions=pred_strs, references=ref_strs)
         batch_err, batch_nref = self.mer_metric.compute_num_denom(
             predictions=pred_strs, references=ref_strs,
