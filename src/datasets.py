@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import random
 import torch
 import torchaudio
@@ -70,6 +71,7 @@ class ASRDataset(Dataset):
         max_duration: Optional[float] = None,
         min_duration: Optional[float] = None,
         audio_chunk_size: Optional[float] = None,
+        audio_chunk_step: Optional[float] = None,
         bucket_by: Literal['audio', 'text', None] = 'audio',
         drop_last: bool = False,
     ):
@@ -82,6 +84,7 @@ class ASRDataset(Dataset):
         self.max_duration = max_duration if max_duration is not None else float('inf')
         self.min_duration = min_duration if min_duration is not None else 0
         self.audio_chunk_size = int(audio_chunk_size * sample_rate) if audio_chunk_size is not None else None
+        self.audio_chunk_step = int(audio_chunk_step * sample_rate) if audio_chunk_step is not None else None
         self.bucket_by = bucket_by
         self.drop_last = drop_last
         self.batch_size = batch_size
@@ -98,6 +101,8 @@ class ASRDataset(Dataset):
                 for line in f:
                     if line.strip():
                         item = json.loads(line)
+                        if not os.path.exists(item['audio_filepath']):
+                            continue
                         if 'duration' not in item:
                             duration = torchaudio.load(item['audio_filepath'])[0].size(0) / self.sample_rate
                         else:
@@ -140,9 +145,13 @@ class ASRDataset(Dataset):
         # Convert to mono if stereo
         if waveform.dim() > 1:
             waveform = waveform.mean(dim=0)
+        # Truncate to audio_chunk_size to guard against manifests whose stated duration
+        # is slightly shorter than the actual file length after resampling.
+        if self.audio_chunk_size is not None and waveform.size(0) > self.audio_chunk_size:
+            waveform = waveform[:self.audio_chunk_size]
         # Drop language with probability language_drop_rate
         language = item.get('language', '<|NO_LANGUAGE_ID|>')
-        if random.random() < self.language_drop_rate and language not in self.never_drop_language:
+        if torch.rand(1).item() < self.language_drop_rate and language not in self.never_drop_language:
             language = '<|NO_LANGUAGE_ID|>'
             
         context_tokens = [self.tokenizer.bos_id]
@@ -188,8 +197,15 @@ class ASRDataset(Dataset):
         target_starts = torch.tensor([item['target_start'] for item in batch], dtype=torch.long)
         target_ends = torch.tensor([item['target_end'] for item in batch], dtype=torch.long)
         language_ids = torch.tensor([item['language_id'] for item in batch], dtype=torch.long)
-        # Pad to longest in batch or to fixed audio_chunk_size
-        waveforms = pad_list_of_tensors(waveforms, pad_value=0, max_length=self.audio_chunk_size)
+        # Pad to nearest audio_chunk_step boundary (e.g. 5s), capped at audio_chunk_size (e.g. 30s)
+        if self.audio_chunk_step is not None:
+            max_wave_len = max(w.size(0) for w in waveforms)
+            effective_max = ((max_wave_len + self.audio_chunk_step - 1) // self.audio_chunk_step) * self.audio_chunk_step
+            if self.audio_chunk_size is not None:
+                effective_max = min(effective_max, self.audio_chunk_size)
+        else:
+            effective_max = self.audio_chunk_size
+        waveforms = pad_list_of_tensors(waveforms, pad_value=0, max_length=effective_max)
         context = pad_list_of_tensors(context_list, pad_value=self.tokenizer.pad_id)
         target = pad_list_of_tensors(target_list, pad_value=self.tokenizer.pad_id)
         
@@ -263,6 +279,7 @@ def get_asr_dataset(
     max_duration: Optional[float] = None,
     min_duration: Optional[float] = None,
     audio_chunk_size: Optional[float] = None,
+    audio_chunk_step: Optional[float] = None,
     bucket_by: Literal['audio', 'text', None] = 'audio',
     drop_last: bool = False,
 ) -> Dataset:
@@ -293,6 +310,7 @@ def get_asr_dataset(
         max_duration=max_duration,
         min_duration=min_duration,
         audio_chunk_size=audio_chunk_size,
+        audio_chunk_step=audio_chunk_step,
         bucket_by=bucket_by,
         drop_last=drop_last,
     )
