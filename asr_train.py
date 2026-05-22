@@ -1,3 +1,7 @@
+import os
+import gc
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import lightning.pytorch as pl
 from lightning.pytorch import seed_everything
 import torch
@@ -23,6 +27,7 @@ def main(cfg):
     # Initialize the weights of the model from another model, if provided via config
     asr_model.maybe_init_from_pretrained_checkpoint(cfg)
 
+    gc.freeze()  # Prevent GC from scanning model objects in forked DataLoader workers (CoW mitigation)
     trainer.fit(asr_model)
 
     if hasattr(cfg.model, 'test_ds') and cfg.model.test_ds.manifest_filepath is not None:

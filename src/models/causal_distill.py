@@ -13,6 +13,8 @@
 # limitations under the License.
 from typing import Dict, Optional, Union
 
+import gc
+
 import torch
 import torch.nn as nn
 from lightning.pytorch import Trainer
@@ -125,7 +127,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         self.ctc_wer = WER(
             decoding=self.ctc_decoding,
             use_cer=self.cfg.aux_ctc.get('use_cer', False),
-            dist_sync_on_step=True,
+            dist_sync_on_step=False,
             log_prediction=self.cfg.get("log_prediction", False),
         )
 
@@ -144,6 +146,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             min_duration=config['min_duration'],
             bucket_by=config.get('bucket_by', 'audio'),
             audio_chunk_size=config.get('audio_chunk_size', None),
+            audio_chunk_step=config.get('audio_chunk_step', None),
             drop_last=config.get('drop_last', True),
             language_file=config.get('language_file', ""),
             language_drop_rate=config.get('language_drop_rate', 0.0),
@@ -166,6 +169,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             shuffle=None,
             num_workers=config.get('num_workers', 0),
             pin_memory=config.get('pin_memory', False),
+            persistent_workers=config.get('num_workers', 0) > 0,
         )
         
     def training_step(self, batch, batch_nb):
@@ -191,8 +195,8 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         teacher_encoded = self.forward(input_signal=teacher_signal, mode='teacher')
         encoded_len = torch.full((student_encoded.shape[0],), student_encoded.shape[2], device=student_encoded.device)
 
-        
         distil_loss = self.distil_loss(student_encoded, teacher_encoded)
+        del teacher_encoded  # free 2× encoder output (~30 MB bf16) before next large alloc
 
         # Reset access registry
         if AccessMixin.is_access_enabled(self.model_guid):
@@ -201,7 +205,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         tensorboard_logs = {
             'train_distil_loss': distil_loss.detach().cpu().item(),
             'learning_rate': self._optimizer.param_groups[0]['lr'],
-            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+            'global_step': self.trainer.global_step,
         }
 
         if hasattr(self, '_trainer') and self._trainer is not None:
@@ -211,12 +215,10 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             log_every_n_steps = 1
             sample_id = batch_nb
 
-        if (sample_id + 1) % log_every_n_steps == 0:
-            compute_wer = True
-        else:
-            compute_wer = False
+        compute_wer = (sample_id + 1) % log_every_n_steps == 0
 
         ctc_output = self.ctc_decoder(student_encoded, return_logits=False, return_softmax=True)
+        del student_encoded  # free encoder output; ctc_output already holds the projected result
 
         if self.ctc_loss_weight > 0:
             ctc_loss = self.ctc_loss(
@@ -226,16 +228,17 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             loss_value = (1 - self.ctc_loss_weight) * distil_loss + self.ctc_loss_weight * ctc_loss
             if compute_wer:
                 self.ctc_wer.update(
-                    predictions=ctc_output, 
+                    predictions=ctc_output,
                     predictions_lengths=encoded_len,
-                    targets=target, 
+                    targets=target,
                     targets_lengths=target_len,
                 )
                 ctc_wer, _, _ = self.ctc_wer.compute()
                 self.ctc_wer.reset()
-                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer})
+                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer.item()})
         else:
             loss_value = distil_loss
+        del ctc_output
 
         loss_value, additional_logs = self.add_interctc_losses(
             loss_value, target, target_len, compute_wer=compute_wer
@@ -261,9 +264,48 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         logs = self.validation_pass(batch, batch_idx, dataloader_idx)
-        self.log_dict(logs, sync_dist=True)
+        # No self.log here — logging happens in on_validation_epoch_end to avoid
+        # Lightning's "same key twice with different arguments" error across dataloaders.
+        if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
+            self.validation_step_outputs[dataloader_idx].append(logs)
+        else:
+            self.validation_step_outputs.append(logs)
         return logs
 
+    def on_validation_epoch_end(self):
+        outputs = self.validation_step_outputs
+        if not outputs:
+            super().on_validation_epoch_end()
+            return
+
+        if isinstance(outputs[0], list):
+            # Per-dataloader val_wer_ctc for wandb
+            for i, dl_outputs in enumerate(outputs):
+                if dl_outputs:
+                    dl_wer = sum(o['val_wer_ctc'] for o in dl_outputs) / len(dl_outputs)
+                    self.log(f'val_wer_ctc_dl{i}', dl_wer, sync_dist=True)
+            all_outputs = [o for dl in outputs for o in dl]
+        else:
+            all_outputs = list(outputs)
+
+        if all_outputs:
+            keys = [k for k in all_outputs[0] if k != 'val_wer_ctc']
+            # Macro avg of val_wer_ctc (bare key) for checkpoint monitor
+            self.log('val_wer_ctc', sum(o['val_wer_ctc'] for o in all_outputs) / len(all_outputs), sync_dist=True)
+            # Macro avg of all other metrics (no suffix), sit alongside training logs in wandb
+            for key in keys:
+                self.log(key, sum(o[key] for o in all_outputs) / len(all_outputs), sync_dist=True)
+
+        self.validation_step_outputs.clear()
+        torch.cuda.empty_cache()
+        gc.collect()
+        super().on_validation_epoch_end()
+
+    def on_train_epoch_end(self):
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    @torch.no_grad()
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
         _, target, _, _, target_start, target_end, waveform, language_ids = batch
         target_len = target_end - target_start
@@ -273,18 +315,19 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         encoded_len = torch.full((student_encoded.shape[0],), student_encoded.shape[2], device=student_encoded.device)
 
         tensorboard_logs = {}
-        distil_loss = self.distil_loss_scale * self.distil_loss(student_encoded, teacher_encoded)
+        # distil_loss already incorporates the scale internally (CosineSimilarityLoss(scale=...))
+        distil_loss = self.distil_loss(student_encoded, teacher_encoded)
         tensorboard_logs['val_distil_loss'] = distil_loss.detach().cpu().item()
+        del teacher_encoded
 
-        compute_wer = True
         ctc_output = self.ctc_decoder(student_encoded, return_logits=False, return_softmax=True)
+        del student_encoded
+
         if self.compute_eval_loss:
             ctc_loss = self.ctc_loss(
                 log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_len
             )
             tensorboard_logs['val_ctc_loss'] = ctc_loss.detach().cpu().item()
-        else:
-            ctc_output = self.ctc_decoder(student_encoded, return_logits=False, return_softmax=True)
 
         self.ctc_wer.update(
             predictions=ctc_output,
@@ -292,11 +335,12 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             targets_lengths=target_len,
             predictions_lengths=encoded_len,
         )
+        del ctc_output
         ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
         self.ctc_wer.reset()
-        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num
-        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom
-        tensorboard_logs['val_wer_ctc'] = ctc_wer
+        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num.item()
+        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom.item()
+        tensorboard_logs['val_wer_ctc'] = ctc_wer.item()
         tensorboard_logs['global_step'] = self.trainer.global_step
 
         if AccessMixin.is_access_enabled(self.model_guid):

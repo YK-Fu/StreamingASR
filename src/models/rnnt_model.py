@@ -39,10 +39,13 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         self.tokenizer = tokenizer
 
     @classmethod
-    def from_config_dict(cls, cfg: DictConfig):
-        # recursively load _module_ with the target module
+    def from_config_dict(cls, config: DictConfig, trainer=None):
         import hydra
-        return hydra.utils.instantiate(cfg)
+        if '_target_' in config:
+            return hydra.utils.instantiate(config)
+        # No _target_ means NeMo's restore flow is instantiating the full model;
+        # delegate to the parent so it properly calls cls(cfg=config, trainer=trainer).
+        return super().from_config_dict(config, trainer=trainer)
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         self.world_size = 1
@@ -112,7 +115,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             batch_dim_index=0,
             use_cer=self.cfg.get('use_cer', False),
             log_prediction=self.cfg.get('log_prediction', True),
-            dist_sync_on_step=True,
+            dist_sync_on_step=False,
         )
 
         self.joint.set_wer(self.wer)
@@ -147,7 +150,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         self.ctc_wer = WER(
             decoding=self.ctc_decoding,
             use_cer=self.cfg.aux_ctc.get('use_cer', False),
-            dist_sync_on_step=True,
+            dist_sync_on_step=False,
             log_prediction=self.cfg.get("log_prediction", False),
         )
         # Setup optimization normalization (if provided in config)
@@ -166,11 +169,14 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             manifest_filepath=config.manifest_filepath,
             tokenizer=self.tokenizer,
             batch_size=config['batch_size'],
-            language_mapping=self.encoder.language_mapping,
+            language_file=config.get('language_file', ""),
             language_drop_rate=config.get('language_drop_rate', 0.0),
+            never_drop_language=config.get('never_drop_language', []),
             sample_rate=config['sample_rate'],
             max_duration=config['max_duration'],
             min_duration=config['min_duration'],
+            audio_chunk_size=config.get('audio_chunk_size', None),
+            audio_chunk_step=config.get('audio_chunk_step', None),
             bucket_by=config.get('bucket_by', 'audio'),
             drop_last=config.get('drop_last', True),
         )
@@ -191,6 +197,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             shuffle=None,
             num_workers=config.get('num_workers', 0),
             pin_memory=config.get('pin_memory', False),
+            persistent_workers=config.get('num_workers', 0) > 0,
         )
 
     def change_decoding_strategy(
@@ -225,7 +232,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                 batch_dim_index=self.wer.batch_dim_index,
                 use_cer=self.wer.use_cer,
                 log_prediction=self.wer.log_prediction,
-                dist_sync_on_step=True,
+                dist_sync_on_step=False,
             )
 
             self.joint.set_wer(self.wer)
@@ -256,7 +263,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                 decoding=self.ctc_decoding,
                 use_cer=self.ctc_wer.use_cer,
                 log_prediction=self.ctc_wer.log_prediction,
-                dist_sync_on_step=True,
+                dist_sync_on_step=False,
             )
 
             self.ctc_decoder.temperature = decoding_cfg.get('temperature', 1.0)
@@ -358,13 +365,13 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             'train_simple_loss': simple_loss.detach().cpu().item(),
             'train_rnnt_loss': rnnt_loss.detach().cpu().item(),
             'learning_rate': self._optimizer.param_groups[0]['lr'],
-            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+            'global_step': self.trainer.global_step,
         }
         if self.llm_loss is not None:
             tensorboard_logs.update({'train_llm_loss': llm_loss.detach().cpu().item()})
 
         if compute_wer:
-            tensorboard_logs.update({'training_batch_wer': wer})
+            tensorboard_logs.update({'training_batch_wer': wer.item()})
 
         simple_loss_weight = 0.5 if self.trainer.global_step > self.cfg.optim.sched.warmup_steps else 1.0 - 0.5 * (self.trainer.global_step / self.cfg.optim.sched.warmup_steps)
         rnnt_loss_weight = 1.0 if self.trainer.global_step > self.cfg.optim.sched.warmup_steps else 0.1 + 0.9 * (self.trainer.global_step / self.cfg.optim.sched.warmup_steps)
@@ -383,7 +390,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                 )
                 ctc_wer, _, _ = self.ctc_wer.compute()
                 self.ctc_wer.reset()
-                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer})
+                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer.item()})
         else:
             loss_value = (1 - self.llm_loss_weight) * (simple_loss_weight * simple_loss + rnnt_loss_weight * rnnt_loss) + self.llm_loss_weight * llm_loss
 
@@ -400,10 +407,11 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         return {'loss': loss_value}
 
-    def forward(self, input_signal):
-        encoded = self.encoder(audio_signal=input_signal)
+    def forward(self, input_signal, language_ids=None):
+        encoded = self.encoder(audio_signal=input_signal, language_ids=language_ids)
         return encoded
 
+    @torch.no_grad()
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
         context, target, attn_mask, position_ids, target_start, target_end, signal, language_ids = batch
         signal, _ = self.preprocessor(raw_speech=signal, length=None)
@@ -411,8 +419,6 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         encoded_len = torch.full((encoded.shape[0],), encoded.shape[2], device=encoded.device)
 
         tensorboard_logs = {}
-        
-        compute_wer = True
 
         if self.compute_eval_loss:
             simple_am, ctc_output = self.ctc_decoder(encoded, return_logits=True, return_softmax=True)
@@ -431,23 +437,21 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             simple_am = None
             simple_lm = None
 
-        # Fused joint step
-        encoded_len = torch.full((encoded.shape[0],), encoded.shape[2], device=encoded.device)
         simple_loss, rnnt_loss, wer, wer_num, wer_denom = self.joint.forward_fused_loss(
-                encoder_outputs=encoded,
-                decoder_outputs=decoded,
-                simple_am=simple_am,
-                simple_lm=simple_lm,
-                am_only_scale=self.cfg.loss.get("am_only_scale", 0.0),
-                lm_only_scale=self.cfg.loss.get("lm_only_scale", 0.25),
-                s_range=self.cfg.loss.get("s_range", 5),
-                encoder_lengths=encoded_len,
-                transcripts=context,
-                targets=target,
-                target_start=target_start,
-                target_end=target_end,
-                compute_wer=compute_wer,
-            )
+            encoder_outputs=encoded,
+            decoder_outputs=decoded,
+            simple_am=simple_am,
+            simple_lm=simple_lm,
+            am_only_scale=self.cfg.loss.get("am_only_scale", 0.0),
+            lm_only_scale=self.cfg.loss.get("lm_only_scale", 0.25),
+            s_range=self.cfg.loss.get("s_range", 5),
+            encoder_lengths=encoded_len,
+            transcripts=context,
+            targets=target,
+            target_start=target_start,
+            target_end=target_end,
+            compute_wer=True,
+        )
 
         if simple_loss is not None:
             simple_loss_weight = 0.5 if self.trainer.global_step > self.cfg.optim.sched.warmup_steps else 1.0 - 0.5 * (self.trainer.global_step / self.cfg.optim.sched.warmup_steps)
@@ -455,12 +459,11 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             tensorboard_logs['val_rnnt_loss'] = rnnt_loss.detach().cpu().item()
             tensorboard_logs['val_simple_loss'] = simple_loss.detach().cpu().item()
             tensorboard_logs['val_ctc_loss'] = ctc_loss.detach().cpu().item()
-            tensorboard_logs['val_loss'] = (1 - self.ctc_loss_weight) * (simple_loss_weight * simple_loss + rnnt_loss_weight * rnnt_loss) + self.ctc_loss_weight * ctc_loss.detach().cpu().item()
+            tensorboard_logs['val_loss'] = ((1 - self.ctc_loss_weight) * (simple_loss_weight * simple_loss + rnnt_loss_weight * rnnt_loss) + self.ctc_loss_weight * ctc_loss).detach().cpu().item()
 
-        tensorboard_logs['val_wer_num'] = wer_num
-        tensorboard_logs['val_wer_denom'] = wer_denom
-        tensorboard_logs['val_wer'] = wer
-
+        tensorboard_logs['val_wer_num'] = wer_num.item()
+        tensorboard_logs['val_wer_denom'] = wer_denom.item()
+        tensorboard_logs['val_wer'] = wer.item()
 
         self.ctc_wer.update(
             predictions=ctc_output,
@@ -470,14 +473,62 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         )
         ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
         self.ctc_wer.reset()
-        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num
-        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom
-        tensorboard_logs['val_wer_ctc'] = ctc_wer
+        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num.item()
+        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom.item()
+        tensorboard_logs['val_wer_ctc'] = ctc_wer.item()
         tensorboard_logs['global_step'] = self.trainer.global_step
 
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
         return tensorboard_logs
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        logs = self.validation_pass(batch, batch_idx, dataloader_idx)
+        if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
+            self.validation_step_outputs[dataloader_idx].append(logs)
+        else:
+            self.validation_step_outputs.append(logs)
+        return logs
+
+    def on_validation_epoch_end(self):
+        outputs = self.validation_step_outputs
+        if not outputs:
+            super().on_validation_epoch_end()
+            return
+
+        if isinstance(outputs[0], list):
+            # Per-dataloader WER for wandb
+            for i, dl_outputs in enumerate(outputs):
+                if not dl_outputs:
+                    continue
+                dl_wer_num = sum(o['val_wer_num'] for o in dl_outputs)
+                dl_wer_denom = sum(o['val_wer_denom'] for o in dl_outputs)
+                dl_ctc_num = sum(o['val_wer_num_ctc'] for o in dl_outputs)
+                dl_ctc_denom = sum(o['val_wer_denom_ctc'] for o in dl_outputs)
+                self.log(f'val_wer_dl{i}', dl_wer_num / dl_wer_denom if dl_wer_denom > 0 else 0.0, sync_dist=True)
+                self.log(f'val_wer_ctc_dl{i}', dl_ctc_num / dl_ctc_denom if dl_ctc_denom > 0 else 0.0, sync_dist=True)
+            all_outputs = [o for dl in outputs for o in dl]
+        else:
+            all_outputs = list(outputs)
+
+        if all_outputs:
+            # Exact global WER using accumulated num/denom
+            total_wer_num = sum(o['val_wer_num'] for o in all_outputs)
+            total_wer_denom = sum(o['val_wer_denom'] for o in all_outputs)
+            total_ctc_num = sum(o['val_wer_num_ctc'] for o in all_outputs)
+            total_ctc_denom = sum(o['val_wer_denom_ctc'] for o in all_outputs)
+            self.log('val_wer', total_wer_num / total_wer_denom if total_wer_denom > 0 else 0.0, sync_dist=True)
+            self.log('val_wer_ctc', total_ctc_num / total_ctc_denom if total_ctc_denom > 0 else 0.0, sync_dist=True)
+            # Macro avg for all other metrics
+            skip = {'val_wer', 'val_wer_ctc', 'val_wer_num', 'val_wer_denom', 'val_wer_num_ctc', 'val_wer_denom_ctc'}
+            for key in [k for k in all_outputs[0] if k not in skip]:
+                self.log(key, sum(o[key] for o in all_outputs) / len(all_outputs), sync_dist=True)
+
+        # NeMo's super().on_validation_epoch_end() calls multi_validation_epoch_end which
+        # does torch.stack on val_wer_num — but we store Python scalars (.item()), not tensors.
+        # Clear first so super() sees an empty list and returns immediately.
+        self.validation_step_outputs.clear()
+        super().on_validation_epoch_end()
 
     def on_save_checkpoint(self, state_dict):
         # in order to resume training from the same point, we need this to prevent from dataloader prefetching the next batch
