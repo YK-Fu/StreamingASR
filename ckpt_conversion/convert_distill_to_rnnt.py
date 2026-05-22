@@ -49,12 +49,12 @@ def load_nemo_checkpoint(nemo_path: str) -> Dict[str, torch.Tensor]:
             
             weights_path = os.path.join(tmpdir, "model_weights.ckpt")
             if os.path.exists(weights_path):
-                checkpoint = torch.load(weights_path, map_location="cpu")
+                checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
             else:
                 for root, dirs, files in os.walk(tmpdir):
                     for f in files:
                         if f.endswith(".ckpt"):
-                            checkpoint = torch.load(os.path.join(root, f), map_location="cpu")
+                            checkpoint = torch.load(os.path.join(root, f), map_location="cpu", weights_only=False)
                             break
                     else:
                         continue
@@ -68,7 +68,7 @@ def load_nemo_checkpoint(nemo_path: str) -> Dict[str, torch.Tensor]:
                 return checkpoint
             return checkpoint
     else:
-        checkpoint = torch.load(nemo_path, map_location="cpu")
+        checkpoint = torch.load(nemo_path, map_location="cpu", weights_only=False)
         if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
             return checkpoint["state_dict"]
         return checkpoint
