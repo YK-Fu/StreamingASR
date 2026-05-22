@@ -115,14 +115,28 @@ class MultiHeadAttention(nn.Module):
         if attn_type == "alibi":
             # Use proper ALiBi slopes from the original paper (handles non-power-of-2 heads)
             self.register_buffer("slopes", get_alibi_slopes(self.n_heads))
+            self._attn_no_cache = {}  # (Q_LEN, KV_LEN, device) -> (score_mod, block_mask)
 
     def _get_score_mask_mod(self, q, k, v, cache):
         if self.attn_type == "alibi":
             if cache is None:
-                q_offset = 0
-                kv_offset = 0
-                max_cache_len = None
+                # Training path: offsets are always 0. Cache per shape+device to avoid
+                # creating new closures and recomputing block_mask on every forward pass.
+                cache_key = (q.shape[2], k.shape[2], q.device)
+                if cache_key not in self._attn_no_cache:
+                    def alibi_score_mod(score, b, h, q_idx, kv_idx):
+                        return score + self.slopes[h] * (kv_idx - q_idx)
+
+                    def alibi_mask_mod(b, h, q_idx, kv_idx):
+                        return q_idx >= kv_idx
+
+                    self._attn_no_cache[cache_key] = (
+                        alibi_score_mod,
+                        create_block_mask(alibi_mask_mod, B=None, H=None, Q_LEN=q.shape[2], KV_LEN=k.shape[2], device=q.device),
+                    )
+                return self._attn_no_cache[cache_key]
             else:
+                # Streaming inference: offsets vary per chunk, cannot cache block_mask.
                 max_cache_len = cache.max_cache_len
                 if not cache.full:
                     q_offset = cache.chunk_start_ptr
@@ -130,20 +144,20 @@ class MultiHeadAttention(nn.Module):
                 else:
                     q_length = abs(cache.chunk_end_ptr - cache.chunk_start_ptr)
                     q_offset = cache.max_cache_len - q_length
-                    kv_offset = - cache.chunk_end_ptr
+                    kv_offset = -cache.chunk_end_ptr
 
-            def alibi_score_mod(score, b, h, q_idx, kv_idx):
-                slope = self.slopes[h]
-                relative_q_idx = q_idx + q_offset
-                relative_kv_idx = kv_idx + kv_offset if max_cache_len is None else (kv_idx + kv_offset) % max_cache_len
-                distance = relative_kv_idx - relative_q_idx
-                return score + slope * distance
+                def alibi_score_mod(score, b, h, q_idx, kv_idx):
+                    slope = self.slopes[h]
+                    relative_q_idx = q_idx + q_offset
+                    relative_kv_idx = (kv_idx + kv_offset) % max_cache_len
+                    return score + slope * (relative_kv_idx - relative_q_idx)
 
-            def alibi_mask_mod(b, h, q_idx, kv_idx):
-                relative_q_idx = q_idx + q_offset
-                relative_kv_idx = kv_idx + kv_offset if max_cache_len is None else (kv_idx + kv_offset) % max_cache_len
-                return relative_q_idx >= relative_kv_idx
-            return alibi_score_mod, create_block_mask(alibi_mask_mod, B=None, H=None, Q_LEN=q.shape[2], KV_LEN=k.shape[2] if max_cache_len is None else max_cache_len)
+                def alibi_mask_mod(b, h, q_idx, kv_idx):
+                    relative_q_idx = q_idx + q_offset
+                    relative_kv_idx = (kv_idx + kv_offset) % max_cache_len
+                    return relative_q_idx >= relative_kv_idx
+
+                return alibi_score_mod, create_block_mask(alibi_mask_mod, B=None, H=None, Q_LEN=q.shape[2], KV_LEN=max_cache_len, device=q.device)
 
         elif self.attn_type == "full":
             return None, None
