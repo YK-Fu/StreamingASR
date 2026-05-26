@@ -374,8 +374,9 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         if compute_wer:
             tensorboard_logs.update({'training_batch_wer': wer.item()})
 
-        simple_loss_weight = 0.5 if self.trainer.global_step > self.cfg.optim.sched.warmup_steps else 1.0 - 0.5 * (self.trainer.global_step / self.cfg.optim.sched.warmup_steps)
-        rnnt_loss_weight = 1.0 if self.trainer.global_step > self.cfg.optim.sched.warmup_steps else 0.1 + 0.9 * (self.trainer.global_step / self.cfg.optim.sched.warmup_steps)
+        loss_warm_steps = self.cfg.loss.get("loss_warm_steps", self.cfg.optim.sched.warmup_steps)
+        simple_loss_weight = 0.5 if self.trainer.global_step > loss_warm_steps else 1.0 - 0.5 * (self.trainer.global_step / loss_warm_steps)
+        rnnt_loss_weight = 1.0 if self.trainer.global_step > loss_warm_steps else 0.1 + 0.9 * (self.trainer.global_step / loss_warm_steps)
         if self.ctc_loss_weight > 0:
             ctc_loss = self.ctc_loss(
                 log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_end - target_start
@@ -455,8 +456,9 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         )
 
         if simple_loss is not None:
-            simple_loss_weight = 0.5 if self.trainer.global_step > self.cfg.optim.sched.warmup_steps else 1.0 - 0.5 * (self.trainer.global_step / self.cfg.optim.sched.warmup_steps)
-            rnnt_loss_weight = 1.0 if self.trainer.global_step > self.cfg.optim.sched.warmup_steps else 0.1 + 0.9 * (self.trainer.global_step / self.cfg.optim.sched.warmup_steps)
+            loss_warm_steps = self.cfg.loss.get("loss_warm_steps", self.cfg.optim.sched.warmup_steps)
+            simple_loss_weight = 0.5 if self.trainer.global_step > loss_warm_steps else 1.0 - 0.5 * (self.trainer.global_step / loss_warm_steps)
+            rnnt_loss_weight = 1.0 if self.trainer.global_step > loss_warm_steps else 0.1 + 0.9 * (self.trainer.global_step / loss_warm_steps)
             tensorboard_logs['val_rnnt_loss'] = rnnt_loss.detach().cpu().item()
             tensorboard_logs['val_simple_loss'] = simple_loss.detach().cpu().item()
             tensorboard_logs['val_ctc_loss'] = ctc_loss.detach().cpu().item()

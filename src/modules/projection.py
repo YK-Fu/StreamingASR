@@ -142,7 +142,7 @@ class PrunedRNNTJoint(RNNTJoint):
                     am_only_scale=am_only_scale,
                     delay_penalty=delay_penalty,
                     boundary=boundary,
-                    reduction='sum',
+                    reduction='none',
                     return_grad=True,
                 )
 
@@ -167,10 +167,24 @@ class PrunedRNNTJoint(RNNTJoint):
                     termination_symbol=blank_symbol,
                     boundary=boundary,
                     delay_penalty=delay_penalty,
-                    reduction='sum',
+                    reduction='none',
                 )
-                rnnt_loss = rnnt_loss / (target_end - target_start).sum()
                 del joint, ranges, boundary
+
+                # Per-sample finite check (icefall style): compute full batch first,
+                # then mask out non-finite samples. Use multiplication (not indexing)
+                # so the computational graph stays connected on all ranks — disconnected
+                # zero tensors cause DDP to hang (find_unused_parameters=False means
+                # DDP waits for every parameter's all-reduce hook to fire).
+                joint_finite = torch.isfinite(simple_loss) & torch.isfinite(rnnt_loss)
+                if not joint_finite.all():
+                    logging.warning(f"{(~joint_finite).sum().item()}/{simple_loss.shape[0]} samples have non-finite loss")
+                # nan_to_num first: inf * 0 = nan in IEEE 754, which would survive sum()
+                simple_loss = simple_loss.nan_to_num(0.0) * joint_finite
+                rnnt_loss   = rnnt_loss.nan_to_num(0.0) * joint_finite
+                target_tokens = ((target_end - target_start) * joint_finite).sum().clamp(min=1)
+                simple_loss = simple_loss.sum() / target_tokens
+                rnnt_loss   = rnnt_loss.sum() / target_tokens
             else:
                 simple_loss = None
                 rnnt_loss = None
