@@ -415,4 +415,15 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             'completed': current_batch_progress,
         }
 
+        state_dict['rng_state'] = {
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all(),
+        }
+
         super().on_save_checkpoint(state_dict)
+
+    def on_load_checkpoint(self, state_dict):
+        if 'rng_state' in state_dict:
+            torch.set_rng_state(state_dict['rng_state']['torch'])
+            torch.cuda.set_rng_state_all(state_dict['rng_state']['cuda'])
+        super().on_load_checkpoint(state_dict)

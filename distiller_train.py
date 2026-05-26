@@ -2,6 +2,7 @@ import os
 import gc
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import torch
 import lightning.pytorch as pl
 from lightning.pytorch import seed_everything
 from omegaconf import OmegaConf
@@ -24,6 +25,21 @@ def main(cfg):
     
     # Initialize the weights of the model from another model, if provided via config
     asr_model.maybe_init_from_pretrained_checkpoint(cfg)
+
+    if cfg.get("torch_compile", False):
+        import torch._dynamo
+        from nemo.core.classes.common import typecheck
+        torch._dynamo.config.suppress_errors = True
+        typecheck.set_typecheck_enabled(False)  # prevent wrapt from blocking dynamo tracing
+        # No k2 in distillation path and input shape is fixed — use static compilation for
+        # maximum kernel specialization. fullgraph=False required because flex_attention's
+        # create_block_mask calls inspect.signature on a closure (alibi_mask_mod), which
+        # dynamo cannot trace; it graph-breaks there and compiles the surrounding ops.
+        # drop_last=True in the dataloader is required to avoid a shape recompilation on
+        # the last (smaller) batch of each epoch.
+        logging.info("torch.compile enabled: compiling student and teacher encoders (dynamic=False, fullgraph=False)")
+        asr_model.student = torch.compile(asr_model.student, dynamic=False, fullgraph=False)
+        asr_model.teacher = torch.compile(asr_model.teacher, dynamic=False, fullgraph=False)
 
     gc.freeze()  # Prevent GC from scanning model objects in forked DataLoader workers (CoW mitigation)
     trainer.fit(asr_model)

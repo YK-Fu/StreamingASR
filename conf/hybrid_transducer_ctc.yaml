@@ -1,6 +1,7 @@
 name: "Qwen-Whisper-Hybrid-Transducer-CTC"
 init_from_nemo_model: ???
 seed: 42
+torch_compile: true  # top-level: read by asr_train.py via cfg.get("torch_compile")
 model:
   sample_rate: 16000
   compute_eval_loss: false # eval samples can be very long and exhaust memory. Disable computation of transducer loss during validation/testing with this flag.
@@ -176,9 +177,9 @@ model:
     s_range: 5            # pruned RNN-T loss: how many symbols to keep for each frame. (reduce a lot of memory and training time)
 
   optim:
-    name: adamw
-    lr: 1e-3
-    eps: 1e-06
+    name: adamw_8bit
+    lr: 5e-4
+    eps: 1e-8
     # optimizer arguments
     betas: [ 0.9, 0.98 ]
     weight_decay: 1e-3

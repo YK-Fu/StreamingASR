@@ -14,6 +14,7 @@
 # 
 # Modifications Copyright (c) 2026, Iven Fu. All rights reserved.
 
+import gc
 from typing import Dict, Optional
 
 import torch
@@ -529,6 +530,12 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         # Clear first so super() sees an empty list and returns immediately.
         self.validation_step_outputs.clear()
         super().on_validation_epoch_end()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    def on_train_epoch_end(self):
+        torch.cuda.empty_cache()
+        gc.collect()
 
     def on_save_checkpoint(self, state_dict):
         # in order to resume training from the same point, we need this to prevent from dataloader prefetching the next batch
@@ -549,5 +556,16 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             'completed': current_batch_progress,
         }
 
+        state_dict['rng_state'] = {
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all(),
+        }
+
         super().on_save_checkpoint(state_dict)
-        
+
+    def on_load_checkpoint(self, state_dict):
+        if 'rng_state' in state_dict:
+            torch.set_rng_state(state_dict['rng_state']['torch'])
+            torch.cuda.set_rng_state_all(state_dict['rng_state']['cuda'])
+        super().on_load_checkpoint(state_dict)
+
