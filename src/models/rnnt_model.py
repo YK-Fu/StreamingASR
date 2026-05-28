@@ -488,7 +488,13 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         logs = self.validation_pass(batch, batch_idx, dataloader_idx)
         if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
-            self.validation_step_outputs[dataloader_idx].append(logs)
+            # NeMo's property only initializes per-dataloader sublists on first access if
+            # _validation_dl is already a list>1 at that moment; and our epoch-end resets
+            # the cache. Lazy-extend here so dataloader_idx is always valid.
+            outputs = self.validation_step_outputs
+            while len(outputs) <= dataloader_idx:
+                outputs.append([])
+            outputs[dataloader_idx].append(logs)
         else:
             self.validation_step_outputs.append(logs)
         return logs
@@ -529,8 +535,9 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         # NeMo's super().on_validation_epoch_end() calls multi_validation_epoch_end which
         # does torch.stack on val_wer_num — but we store Python scalars (.item()), not tensors.
-        # Clear first so super() sees an empty list and returns immediately.
-        self.validation_step_outputs.clear()
+        # Reset cache so super() sees an empty list AND the property re-initializes the
+        # per-dataloader sublists on next epoch (in-place clear() would leave a flat []).
+        self._validation_step_outputs = None
         super().on_validation_epoch_end()
         torch.cuda.empty_cache()
         gc.collect()
