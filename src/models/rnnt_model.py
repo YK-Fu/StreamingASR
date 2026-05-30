@@ -322,7 +322,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         if self.is_interctc_enabled():
             AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
 
-        context, target, attn_mask, position_ids, target_start, target_end, waveform, language_ids = batch
+        context, target, attn_mask, target_start, target_end, waveform, language_ids = batch
 
         # Do not pass length to the preprocessor, it will be computed in the preprocessor (padding as blank training)
         signal, signal_length = self.preprocessor(raw_speech=waveform, length=None)
@@ -338,7 +338,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             simple_am = self.ctc_decoder(encoded, return_logits=True, return_softmax=False)
 
         # do not include the last token in the context for the decoder (this model does not predict eos token)
-        decoded, _ = self.decoder(input_ids=context, attn_mask=attn_mask, position_ids=position_ids)
+        decoded, _ = self.decoder(input_ids=context, attn_mask=attn_mask)
         if self.llm_head.tie_weights:
             if self.llm_loss is not None:
                 simple_lm, lm_output = self.llm_head(decoded, return_logits=True, return_softmax=True, weights=self.llm_head_weights)
@@ -365,7 +365,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         if self.llm_loss is not None:
             _, _, v = simple_lm.size()
             # We do not predict the eos token, so we does not need the last output token 
-            llm_loss = self.llm_loss(lm_output[:, :-1].reshape(-1, v), context[..., 1:].reshape(-1), position_ids, target_start, target_end)
+            llm_loss = self.llm_loss(lm_output[:, :-1].reshape(-1, v), context[..., 1:].reshape(-1), target_start, target_end)
         else:
             llm_loss = 0
 
@@ -396,16 +396,16 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             AccessMixin.reset_registry(self)
 
         tensorboard_logs = {
-            'train_simple_loss': simple_loss.detach().cpu().item(),
-            'train_rnnt_loss': rnnt_loss.detach().cpu().item(),
+            'train_simple_loss': simple_loss.detach(),
+            'train_rnnt_loss': rnnt_loss.detach(),
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'global_step': self.trainer.global_step,
         }
         if self.llm_loss is not None:
-            tensorboard_logs.update({'train_llm_loss': llm_loss.detach().cpu().item()})
+            tensorboard_logs.update({'train_llm_loss': llm_loss.detach()})
 
         if compute_wer:
-            tensorboard_logs.update({'training_batch_wer': wer.item()})
+            tensorboard_logs.update({'training_batch_wer': wer.detach()})
 
         # Icefall-style discrete warmup: keep pruned_loss off entirely until the
         # smoothed-loss path has trained simple_am_proj (= ctc_decoder) enough that
@@ -424,7 +424,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             ctc_loss = self.ctc_loss(
                 log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_end - target_start
             )
-            tensorboard_logs.update({'train_ctc_loss': ctc_loss.detach().cpu().item()})
+            tensorboard_logs.update({'train_ctc_loss': ctc_loss.detach()})
             loss_value = (1 - self.ctc_loss_weight - self.llm_loss_weight) * (simple_loss_weight * simple_loss + rnnt_loss_weight * rnnt_loss) + self.ctc_loss_weight * ctc_loss + self.llm_loss_weight * llm_loss
             if compute_wer:
                 self.ctc_wer.update(
@@ -435,7 +435,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                 )
                 ctc_wer, _, _ = self.ctc_wer.compute()
                 self.ctc_wer.reset()
-                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer.item()})
+                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer.detach()})
         else:
             loss_value = (1 - self.llm_loss_weight) * (simple_loss_weight * simple_loss + rnnt_loss_weight * rnnt_loss) + self.llm_loss_weight * llm_loss
 
@@ -443,7 +443,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             loss_value, target, target_end - target_start, compute_wer=compute_wer
         )
 
-        tensorboard_logs.update({'train_loss': loss_value.detach().cpu().item()})
+        tensorboard_logs.update({'train_loss': loss_value.detach()})
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
@@ -470,7 +470,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
     @torch.no_grad()
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        context, target, attn_mask, position_ids, target_start, target_end, signal, language_ids = batch
+        context, target, attn_mask, target_start, target_end, signal, language_ids = batch
         signal, _ = self.preprocessor(raw_speech=signal, length=None)
         encoded = self.forward(input_signal=signal, language_ids=language_ids)
         encoded_len = torch.full((encoded.shape[0],), encoded.shape[2], device=encoded.device)
@@ -479,7 +479,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         if self.compute_eval_loss:
             simple_am, ctc_output = self.ctc_decoder(encoded, return_logits=True, return_softmax=True)
-            decoded, _ = self.decoder(input_ids=context[..., :-1], attn_mask=attn_mask, position_ids=position_ids)
+            decoded, _ = self.decoder(input_ids=context[..., :-1], attn_mask=attn_mask)
             if self.llm_head.tie_weights:
                 simple_lm = self.llm_head(decoded, return_logits=True, return_softmax=False, weights=self.llm_head_weights)
             else:
@@ -487,7 +487,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             ctc_loss = self.ctc_loss(
                 log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_end - target_start
             )
-            tensorboard_logs['val_ctc_loss'] = ctc_loss.detach().cpu().item()
+            tensorboard_logs['val_ctc_loss'] = ctc_loss.detach()
         else:
             ctc_output = self.ctc_decoder(encoded, return_logits=False, return_softmax=True)
             decoded = None
@@ -519,14 +519,14 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                 simple_loss_weight, rnnt_loss_weight = 1.0, 0.1
             else:
                 simple_loss_weight, rnnt_loss_weight = 0.5, 1.0
-            tensorboard_logs['val_rnnt_loss'] = rnnt_loss.detach().cpu().item()
-            tensorboard_logs['val_simple_loss'] = simple_loss.detach().cpu().item()
-            tensorboard_logs['val_ctc_loss'] = ctc_loss.detach().cpu().item()
-            tensorboard_logs['val_loss'] = ((1 - self.ctc_loss_weight) * (simple_loss_weight * simple_loss + rnnt_loss_weight * rnnt_loss) + self.ctc_loss_weight * ctc_loss).detach().cpu().item()
+            tensorboard_logs['val_rnnt_loss'] = rnnt_loss.detach()
+            tensorboard_logs['val_simple_loss'] = simple_loss.detach()
+            tensorboard_logs['val_ctc_loss'] = ctc_loss.detach()
+            tensorboard_logs['val_loss'] = ((1 - self.ctc_loss_weight) * (simple_loss_weight * simple_loss + rnnt_loss_weight * rnnt_loss) + self.ctc_loss_weight * ctc_loss).detach()
 
-        tensorboard_logs['val_wer_num'] = wer_num.item()
-        tensorboard_logs['val_wer_denom'] = wer_denom.item()
-        tensorboard_logs['val_wer'] = wer.item()
+        tensorboard_logs['val_wer_num'] = wer_num.detach()
+        tensorboard_logs['val_wer_denom'] = wer_denom.detach()
+        tensorboard_logs['val_wer'] = wer.detach()
 
         self.ctc_wer.update(
             predictions=ctc_output,
@@ -536,9 +536,9 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         )
         ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
         self.ctc_wer.reset()
-        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num.item()
-        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom.item()
-        tensorboard_logs['val_wer_ctc'] = ctc_wer.item()
+        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num.detach()
+        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom.detach()
+        tensorboard_logs['val_wer_ctc'] = ctc_wer.detach()
         tensorboard_logs['global_step'] = self.trainer.global_step
 
         if AccessMixin.is_access_enabled(self.model_guid):
@@ -594,9 +594,10 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                 self.log(key, sum(o[key] for o in all_outputs) / len(all_outputs), sync_dist=True)
 
         # NeMo's super().on_validation_epoch_end() calls multi_validation_epoch_end which
-        # does torch.stack on val_wer_num — but we store Python scalars (.item()), not tensors.
-        # Reset cache so super() sees an empty list AND the property re-initializes the
-        # per-dataloader sublists on next epoch (in-place clear() would leave a flat []).
+        # does torch.stack on val_wer_num — we now store detached tensors (no .detach() sync),
+        # but stack across batches with mismatched shapes/dtypes still fails. Reset cache so
+        # super() sees an empty list AND the property re-initializes the per-dataloader
+        # sublists on next epoch (in-place clear() would leave a flat []).
         self._validation_step_outputs = None
         super().on_validation_epoch_end()
         torch.cuda.empty_cache()

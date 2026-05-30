@@ -203,7 +203,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             AccessMixin.reset_registry(self)
 
         tensorboard_logs = {
-            'train_distil_loss': distil_loss.detach().cpu().item(),
+            'train_distil_loss': distil_loss.detach(),
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'global_step': self.trainer.global_step,
         }
@@ -224,7 +224,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             ctc_loss = self.ctc_loss(
                 log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_len
             )
-            tensorboard_logs.update({'train_ctc_loss': ctc_loss.detach().cpu().item()})
+            tensorboard_logs.update({'train_ctc_loss': ctc_loss.detach()})
             loss_value = (1 - self.ctc_loss_weight) * distil_loss + self.ctc_loss_weight * ctc_loss
             if compute_wer:
                 self.ctc_wer.update(
@@ -235,7 +235,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
                 )
                 ctc_wer, _, _ = self.ctc_wer.compute()
                 self.ctc_wer.reset()
-                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer.item()})
+                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer.detach()})
         else:
             loss_value = distil_loss
         del ctc_output
@@ -244,7 +244,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             loss_value, target, target_len, compute_wer=compute_wer
         )
 
-        tensorboard_logs.update({'train_loss': loss_value.detach().cpu().item()})
+        tensorboard_logs.update({'train_loss': loss_value.detach()})
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
@@ -317,7 +317,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         tensorboard_logs = {}
         # distil_loss already incorporates the scale internally (CosineSimilarityLoss(scale=...))
         distil_loss = self.distil_loss(student_encoded, teacher_encoded)
-        tensorboard_logs['val_distil_loss'] = distil_loss.detach().cpu().item()
+        tensorboard_logs['val_distil_loss'] = distil_loss.detach()
         del teacher_encoded
 
         ctc_output = self.ctc_decoder(student_encoded, return_logits=False, return_softmax=True)
@@ -327,7 +327,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             ctc_loss = self.ctc_loss(
                 log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_len
             )
-            tensorboard_logs['val_ctc_loss'] = ctc_loss.detach().cpu().item()
+            tensorboard_logs['val_ctc_loss'] = ctc_loss.detach()
 
         self.ctc_wer.update(
             predictions=ctc_output,
@@ -338,9 +338,9 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         del ctc_output
         ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
         self.ctc_wer.reset()
-        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num.item()
-        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom.item()
-        tensorboard_logs['val_wer_ctc'] = ctc_wer.item()
+        tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num.detach()
+        tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom.detach()
+        tensorboard_logs['val_wer_ctc'] = ctc_wer.detach()
         tensorboard_logs['global_step'] = self.trainer.global_step
 
         if AccessMixin.is_access_enabled(self.model_guid):
