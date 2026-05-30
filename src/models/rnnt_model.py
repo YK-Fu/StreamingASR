@@ -74,6 +74,13 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         self.preprocessor = HybridRNNTCTCWhisperLMModel.from_config_dict(self.cfg.preprocessor)
         self.encoder = HybridRNNTCTCWhisperLMModel.from_config_dict(self.cfg.encoder)
+        # If every encoder param is frozen, force eval() and skip autograd through
+        # the encoder. eval() disables dropout (deterministic + faster); torch.no_grad
+        # in forward() avoids saving the ~1.6B-param encoder's activations.
+        self._encoder_frozen = not any(p.requires_grad for p in self.encoder.parameters())
+        if self._encoder_frozen:
+            self.encoder.eval()
+            logging.info("Encoder fully frozen: forcing eval() and disabling autograd through encoder forward")
         self.decoder = HybridRNNTCTCWhisperLMModel.from_config_dict(self.cfg.decoder)
 
         if hasattr(self.cfg, 'aux_llm') and self.cfg.aux_llm.llm_loss_weight > 0:
@@ -446,8 +453,20 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         return {'loss': loss_value}
 
     def forward(self, input_signal, language_ids=None):
-        encoded = self.encoder(audio_signal=input_signal, language_ids=language_ids)
+        if self._encoder_frozen:
+            with torch.no_grad():
+                encoded = self.encoder(audio_signal=input_signal, language_ids=language_ids)
+        else:
+            encoded = self.encoder(audio_signal=input_signal, language_ids=language_ids)
         return encoded
+
+    def train(self, mode: bool = True):
+        # Lightning calls model.train() on every train epoch, which propagates to all
+        # submodules and re-enables encoder dropout. Pin encoder to eval() when frozen.
+        super().train(mode)
+        if self._encoder_frozen:
+            self.encoder.eval()
+        return self
 
     @torch.no_grad()
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
