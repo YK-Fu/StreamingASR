@@ -34,27 +34,33 @@ def update_token_id_in_config(config_dict, key, token_mapping):
 def saving_updated_qwenvl(old_model, new_vocab_size, token_mapping, output_path):
     """Save updated Qwen-VL model with new vocabulary."""
     embed_layer, lm_head, model_type = get_embed_and_lm_head(old_model)
-    
-    # Define new modules (extra special tokens beyond token_mapping get random init)
+
+    # Define new modules
     new_embeds = torch.nn.Embedding(
-        new_vocab_size, 
-        old_model.config.hidden_size, 
+        new_vocab_size,
+        old_model.config.hidden_size,
         dtype=embed_layer.weight.dtype
     )
     new_lm_head = torch.nn.Linear(
-        old_model.config.hidden_size, 
-        new_vocab_size, 
-        bias=False, 
+        old_model.config.hidden_size,
+        new_vocab_size,
+        bias=False,
         dtype=lm_head.weight.dtype
     )
-    
+
     num_mapped = len(token_mapping)
     assert len(set(token_mapping)) == num_mapped
     mapping_tensor = torch.LongTensor(token_mapping).to(old_model.device)
     new_embeds.weight.data[:num_mapped] = embed_layer.weight.data[mapping_tensor]
     new_lm_head.weight.data[:num_mapped] = lm_head.weight.data[mapping_tensor]
+    # Default-init rows have magnitudes ~60x larger than pretrained rows (Embedding
+    # defaults to N(0,1)). Seed extras from the source <|endoftext|> row instead so
+    # the residual stream sees a sane direction at every BOS/lang-id position.
     if new_vocab_size > num_mapped:
-        print(f"  {new_vocab_size - num_mapped} extra special token(s) randomly initialized")
+        proto_id = old_model.config.eos_token_id
+        new_embeds.weight.data[num_mapped:]  = embed_layer.weight.data[proto_id]
+        new_lm_head.weight.data[num_mapped:] = lm_head.weight.data[proto_id]
+        print(f"  {new_vocab_size - num_mapped} extra special token(s) initialized from source token id {proto_id} (<|endoftext|>)")
     
     # Update model weights
     if model_type == 'qwen2':
@@ -91,29 +97,35 @@ def saving_updated_qwen(old_model, new_vocab_size, token_mapping, output_path):
     embed_layer, lm_head, model_type = get_embed_and_lm_head(old_model)
     
     print(f"Detected model architecture: {model_type}")
-    
-    # Define new modules (extra special tokens beyond token_mapping get random init)
+
+    # Define new modules
     new_embeds = torch.nn.Embedding(
-        new_vocab_size, 
-        old_model.config.hidden_size, 
+        new_vocab_size,
+        old_model.config.hidden_size,
         dtype=embed_layer.weight.dtype
     )
     new_lm_head = torch.nn.Linear(
-        old_model.config.hidden_size, 
-        new_vocab_size, 
-        bias=False, 
+        old_model.config.hidden_size,
+        new_vocab_size,
+        bias=False,
         dtype=lm_head.weight.dtype
     )
-    
+
     num_mapped = len(token_mapping)
     assert len(set(token_mapping)) == num_mapped, \
         f"Mapping has duplicates: {len(set(token_mapping))} unique vs {num_mapped} expected"
-    
+
     mapping_tensor = torch.LongTensor(token_mapping).to(old_model.device)
     new_embeds.weight.data[:num_mapped] = embed_layer.weight.data[mapping_tensor]
     new_lm_head.weight.data[:num_mapped] = lm_head.weight.data[mapping_tensor]
+    # Default-init rows have magnitudes ~60x larger than pretrained rows (Embedding
+    # defaults to N(0,1)). Seed extras from the source <|endoftext|> row instead so
+    # the residual stream sees a sane direction at every BOS/lang-id position.
     if new_vocab_size > num_mapped:
-        print(f"  {new_vocab_size - num_mapped} extra special token(s) randomly initialized")
+        proto_id = old_model.config.eos_token_id
+        new_embeds.weight.data[num_mapped:]  = embed_layer.weight.data[proto_id]
+        new_lm_head.weight.data[num_mapped:] = lm_head.weight.data[proto_id]
+        print(f"  {new_vocab_size - num_mapped} extra special token(s) initialized from source token id {proto_id} (<|endoftext|>)")
     
     # Update model weights based on architecture
     if model_type == 'qwen2':
