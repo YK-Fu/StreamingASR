@@ -172,32 +172,6 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         self.setup_interctc(decoder_name='ctc_decoder', loss_name='ctc_loss', wer_name='ctc_wer')
 
-        # When using bnb 8-bit optimizers, keep Adam state in fp32 for these heads /
-        # embeddings (8-bit state can destabilize output projections and embeddings).
-        # No-op for plain AdamW.
-        if (self.cfg.get("optim") or {}).get("name", "").endswith("_8bit"):
-            self._register_fp32_optimizer_state([
-                # self.ctc_decoder,
-                # self.llm_head,
-                # self.decoder.prediction.embed_tokens,
-                # self.joint,
-            ])
-
-    def _register_fp32_optimizer_state(self, modules):
-        """Pin AdamW8bit's Adam state to fp32 for params under the given modules.
-
-        Lazy-imports bitsandbytes so this file stays importable without bnb installed.
-        Must run before configure_optimizers() builds the optimizer — Lightning calls
-        configure_optimizers() inside trainer.fit(), so end-of-__init__ is in time.
-        """
-        import bitsandbytes as bnb
-        mng = bnb.optim.GlobalOptimManager.get_instance()
-        mng.register_parameters(list(self.parameters()))
-        for m in modules:
-            for p in m.parameters(recurse=True):
-                if p.requires_grad:
-                    mng.override_config(p, key='optim_bits', value=32)
-
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         dataset = get_asr_dataset(
             manifest_filepath=config.manifest_filepath,
