@@ -165,6 +165,32 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         self.setup_interctc(decoder_name='ctc_decoder', loss_name='ctc_loss', wer_name='ctc_wer')
 
+        # When using bnb 8-bit optimizers, keep Adam state in fp32 for these heads /
+        # embeddings (8-bit state can destabilize output projections and embeddings).
+        # No-op for plain AdamW.
+        if (self.cfg.get("optim") or {}).get("name", "").endswith("_8bit"):
+            self._register_fp32_optimizer_state([
+                # self.ctc_decoder,
+                # self.llm_head,
+                # self.decoder.prediction.embed_tokens,
+                # self.joint,
+            ])
+
+    def _register_fp32_optimizer_state(self, modules):
+        """Pin AdamW8bit's Adam state to fp32 for params under the given modules.
+
+        Lazy-imports bitsandbytes so this file stays importable without bnb installed.
+        Must run before configure_optimizers() builds the optimizer — Lightning calls
+        configure_optimizers() inside trainer.fit(), so end-of-__init__ is in time.
+        """
+        import bitsandbytes as bnb
+        mng = bnb.optim.GlobalOptimManager.get_instance()
+        mng.register_parameters(list(self.parameters()))
+        for m in modules:
+            for p in m.parameters(recurse=True):
+                if p.requires_grad:
+                    mng.override_config(p, key='optim_bits', value=32)
+
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         dataset = get_asr_dataset(
             manifest_filepath=config.manifest_filepath,
@@ -374,9 +400,19 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         if compute_wer:
             tensorboard_logs.update({'training_batch_wer': wer.item()})
 
+        # Icefall-style discrete warmup: keep pruned_loss off entirely until the
+        # smoothed-loss path has trained simple_am_proj (= ctc_decoder) enough that
+        # k2.get_rnnt_prune_ranges covers the true alignment. Phase 1 (warmup<1):
+        # simple only. Phase 2 (1<=warmup<2): 10% pruned. Phase 3: full pruned,
+        # reduced simple.
         loss_warm_steps = self.cfg.loss.get("loss_warm_steps", self.cfg.optim.sched.warmup_steps)
-        simple_loss_weight = 0.5 if self.trainer.global_step > loss_warm_steps else 1.0 - 0.5 * (self.trainer.global_step / loss_warm_steps)
-        rnnt_loss_weight = 1.0 if self.trainer.global_step > loss_warm_steps else 0.1 + 0.9 * (self.trainer.global_step / loss_warm_steps)
+        warmup = self.trainer.global_step / max(loss_warm_steps, 1)
+        if warmup < 1.0:
+            simple_loss_weight, rnnt_loss_weight = 1.0, 0.0
+        elif warmup < 2.0:
+            simple_loss_weight, rnnt_loss_weight = 1.0, 0.1
+        else:
+            simple_loss_weight, rnnt_loss_weight = 0.5, 1.0
         if self.ctc_loss_weight > 0:
             ctc_loss = self.ctc_loss(
                 log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_end - target_start
@@ -457,8 +493,13 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         if simple_loss is not None:
             loss_warm_steps = self.cfg.loss.get("loss_warm_steps", self.cfg.optim.sched.warmup_steps)
-            simple_loss_weight = 0.5 if self.trainer.global_step > loss_warm_steps else 1.0 - 0.5 * (self.trainer.global_step / loss_warm_steps)
-            rnnt_loss_weight = 1.0 if self.trainer.global_step > loss_warm_steps else 0.1 + 0.9 * (self.trainer.global_step / loss_warm_steps)
+            warmup = self.trainer.global_step / max(loss_warm_steps, 1)
+            if warmup < 1.0:
+                simple_loss_weight, rnnt_loss_weight = 1.0, 0.0
+            elif warmup < 2.0:
+                simple_loss_weight, rnnt_loss_weight = 1.0, 0.1
+            else:
+                simple_loss_weight, rnnt_loss_weight = 0.5, 1.0
             tensorboard_logs['val_rnnt_loss'] = rnnt_loss.detach().cpu().item()
             tensorboard_logs['val_simple_loss'] = simple_loss.detach().cpu().item()
             tensorboard_logs['val_ctc_loss'] = ctc_loss.detach().cpu().item()
