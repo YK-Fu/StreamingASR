@@ -6,11 +6,15 @@ import torch
 import lightning.pytorch as pl
 from lightning.pytorch import seed_everything
 from omegaconf import OmegaConf
+import bitsandbytes as bnb
 
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
 from nemo.utils.trainer_utils import resolve_trainer_cfg
+from nemo.core.optim import register_optimizer
+from nemo.core.config.optimizers import AdamWParams
+register_optimizer("adamw_8bit", bnb.optim.AdamW8bit, AdamWParams)
 
 from src.models.causal_distill import CausalWhisperDistilModel
 
