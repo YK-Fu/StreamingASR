@@ -305,6 +305,26 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         torch.cuda.empty_cache()
         gc.collect()
 
+    def on_after_backward(self):
+        # Replaces NeMo ASRModel.on_after_backward (Python-loop scan over every
+        # named_parameter with per-param isnan/isinf + .any() syncs). One fused
+        # _foreach_norm call propagates nan/inf into a single scalar; one host
+        # sync at the end. Intentionally does NOT call super() to skip NeMo's
+        # slow path — Lightning's base on_after_backward is a no-op.
+        if not getattr(self, '_skip_nan_grad', False):
+            return
+        grads = [p.grad for p in self.parameters() if p.grad is not None]
+        if not grads:
+            return
+        norms = torch._foreach_norm(grads, 2.0)
+        total = torch.stack(norms).sum()
+        valid = torch.isfinite(total).to(torch.float32).view(1)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(valid, op=torch.distributed.ReduceOp.MIN)
+        if valid.item() < 1:
+            logging.warning('detected inf or nan values in gradients! Setting gradients to zero.')
+            self.zero_grad()
+
     @torch.no_grad()
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
         _, target, _, target_start, target_end, waveform, language_ids = batch
