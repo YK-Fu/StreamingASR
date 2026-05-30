@@ -115,7 +115,6 @@ model:
       attention_bias: false
       attention_dropout: 0.0
       mlp_bias: false
-      tie_word_embeddings: false # Set to true to tie the word embeddings of the decoder and the encoder. This reduces the parameter count of the model.
       attn_implementation: "flash_attention_2"
 
     # Simple projection layer for pruned RNN-T loss.

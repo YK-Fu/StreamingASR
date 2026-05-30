@@ -120,14 +120,10 @@ def convert_qwen_decoder_weights(
     return converted, lm_head_weight
 
 
-def load_distill_weights_to_rnnt(distill_state, model, copy_ctc_decoder=True):
+def load_distill_weights_to_rnnt(distill_state, model):
     """
-    Load distillation model student weights into RNNT model encoder.
-    
-    Args:
-        distill_state: State dict from distillation model
-        model: HybridRNNTCTCWhisperLMModel instance
-        copy_ctc_decoder: Whether to copy CTC decoder weights
+    Load distillation model student weights into RNNT encoder, and ctc_decoder
+    weights into the RNNT ctc_decoder.
     """
     # Extract student encoder weights (remove "student." prefix)
     print("\n=== Loading student encoder weights into RNNT encoder ===")
@@ -137,7 +133,7 @@ def load_distill_weights_to_rnnt(distill_state, model, copy_ctc_decoder=True):
             new_key = key[len("student."):]
             student_encoder_state[new_key] = value
     print(f"Student encoder keys: {len(student_encoder_state)}")
-    
+
     missing, unexpected = model.encoder.load_state_dict(student_encoder_state, strict=False)
     if missing:
         # Filter out slopes (expected to be missing, auto-computed for ALiBi)
@@ -149,26 +145,25 @@ def load_distill_weights_to_rnnt(distill_state, model, copy_ctc_decoder=True):
     if unexpected:
         print(f"  Unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Unexpected keys: {unexpected}")
     print("  Encoder weights loaded successfully")
-    
-    # Extract and load CTC decoder weights if requested
-    if copy_ctc_decoder:
-        print("\n=== Loading CTC decoder weights ===")
-        ctc_decoder_state = {}
-        for key, value in distill_state.items():
-            if key.startswith("ctc_decoder."):
-                new_key = key[len("ctc_decoder."):]
-                ctc_decoder_state[new_key] = value
-        
-        if ctc_decoder_state:
-            print(f"CTC decoder keys: {len(ctc_decoder_state)}")
-            missing, unexpected = model.ctc_decoder.load_state_dict(ctc_decoder_state, strict=False)
-            if missing:
-                print(f"  Missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Missing keys: {missing}")
-            if unexpected:
-                print(f"  Unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Unexpected keys: {unexpected}")
-            print("  CTC decoder weights loaded successfully")
-        else:
-            print("  No CTC decoder weights found in distillation checkpoint")
+
+    # Extract and load CTC decoder weights
+    print("\n=== Loading CTC decoder weights ===")
+    ctc_decoder_state = {}
+    for key, value in distill_state.items():
+        if key.startswith("ctc_decoder."):
+            new_key = key[len("ctc_decoder."):]
+            ctc_decoder_state[new_key] = value
+
+    if ctc_decoder_state:
+        print(f"CTC decoder keys: {len(ctc_decoder_state)}")
+        missing, unexpected = model.ctc_decoder.load_state_dict(ctc_decoder_state, strict=False)
+        if missing:
+            print(f"  Missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Missing keys: {missing}")
+        if unexpected:
+            print(f"  Unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Unexpected keys: {unexpected}")
+        print("  CTC decoder weights loaded successfully")
+    else:
+        print("  No CTC decoder weights found in distillation checkpoint")
 
 
 def load_qwen_decoder_weights(qwen_path, model):
@@ -183,7 +178,7 @@ def load_qwen_decoder_weights(qwen_path, model):
     decoder_state, lm_head_weight = convert_qwen_decoder_weights(
         qwen_path,
         vocab_size=model.tokenizer.vocab_size,
-        tie_weights=model.cfg.decoder.config.get("tie_word_embeddings", True)
+        tie_weights=model.cfg.decoder.projection.get("tie_weights", False),
     )
     
     missing, unexpected = model.decoder.prediction.load_state_dict(decoder_state, strict=False)
@@ -238,16 +233,7 @@ def main():
         help="HuggingFace Qwen model path for decoder initialization (optional)"
     )
     
-    # CTC decoder option
-    parser.add_argument(
-        "--no-copy-ctc-decoder",
-        action="store_true",
-        help="Do not copy CTC decoder weights from distillation model"
-    )
-    
     args = parser.parse_args()
-    
-    copy_ctc_decoder = not args.no_copy_ctc_decoder
     
     print("=" * 60)
     print("Distillation to RNNT Checkpoint Conversion")
@@ -257,25 +243,24 @@ def main():
     print(f"Output: {args.output}")
     if args.qwen:
         print(f"Qwen: {args.qwen}")
-    print(f"Copy CTC decoder: {copy_ctc_decoder}")
-    
+
     # Load config and create dummy trainer
     config = OmegaConf.load(args.config)
     seed_everything(config.seed)
     dummy_trainer = pl.Trainer(**resolve_trainer_cfg(config.trainer))
-    
+
     # Load distillation checkpoint
     print(f"\n=== Loading distillation checkpoint from {args.distill_checkpoint} ===")
     distill_state = load_nemo_checkpoint(args.distill_checkpoint)
-    
+
     # Create RNNT model
     print(f"\n=== Creating HybridRNNTCTCWhisperLMModel ===")
     from src.models.rnnt_model import HybridRNNTCTCWhisperLMModel
     model = HybridRNNTCTCWhisperLMModel(cfg=config.model, trainer=dummy_trainer)
-    
-    # Load distillation student weights into encoder
-    load_distill_weights_to_rnnt(distill_state, model, copy_ctc_decoder=copy_ctc_decoder)
-    
+
+    # Load distillation student weights into encoder and ctc_decoder
+    load_distill_weights_to_rnnt(distill_state, model)
+
     # Load Qwen decoder
     load_qwen_decoder_weights(args.qwen, model)
     

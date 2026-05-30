@@ -236,14 +236,14 @@ def convert_qwen_decoder_weights(
 def create_rnnt_model_checkpoint(whisper_path, qwen_path, model):
     # Validate config before conversion
     validate_whisper_config(whisper_path, model.cfg.encoder)
-    
+
     # Convert and load encoder weights
     print(f"\n=== Converting Whisper encoder ===")
     encoder_state = convert_whisper_encoder_weights(
         whisper_path,
         include_position_embeddings=model.cfg.encoder.get("position_embedding_type", "alibi") == "learned"
     )
-    
+
     # Load encoder weights
     missing, unexpected = model.encoder.load_state_dict(encoder_state, strict=False)
     if missing:
@@ -257,7 +257,7 @@ def create_rnnt_model_checkpoint(whisper_path, qwen_path, model):
     decoder_state, lm_head_weight = convert_qwen_decoder_weights(
         qwen_path,
         vocab_size=model.tokenizer.vocab_size,
-        tie_weights=model.cfg.get("tie_word_embeddings", False)
+        tie_weights=model.cfg.decoder.projection.get("tie_weights", False),
     )
     
     # Load decoder weights (into decoder.prediction)
