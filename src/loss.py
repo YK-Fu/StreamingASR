@@ -87,7 +87,6 @@ class NLLLoss(nn.NLLLoss, Serialization, Typing):
         return {
             "log_probs": NeuralType(('B * T * D'), LogprobsType()),
             "targets": NeuralType(('B * T'), LabelsType()),
-            "position_ids": NeuralType(('B * T'), LengthsType()),
             "target_start": NeuralType(('B'), LengthsType()),
             "target_end": NeuralType(('B'), LengthsType()),
         }
@@ -100,17 +99,21 @@ class NLLLoss(nn.NLLLoss, Serialization, Typing):
         """
         return {"loss": NeuralType(elements_type=LossType())}
 
-    def forward(self, log_probs, targets, position_ids, target_start, target_end):
+    def forward(self, log_probs, targets, target_start, target_end):
         loss = super().forward(log_probs, targets)
-        # Offset the target start and end by 1 because of next unit prediction (target is the shift one of input)
-        target_mask = ((position_ids[:, :-1] >= (target_start - 1).unsqueeze(1)) & (position_ids[:, :-1] < (target_end - 1).unsqueeze(1))).reshape(-1)
+        # Offset the target start and end by 1 because of next unit prediction (target is the shift one of input).
+        # log_probs is pre-flattened from (B, L-1, V); recover (B, L-1) shape for the mask via arange.
+        batch_size = target_start.shape[0]
+        seq_len = log_probs.shape[0] // batch_size
+        arange = torch.arange(seq_len, device=log_probs.device).unsqueeze(0)  # (1, L-1)
+        target_mask = ((arange >= (target_start - 1).unsqueeze(1)) & (arange < (target_end - 1).unsqueeze(1))).reshape(-1)
         loss = (loss * target_mask).sum()
         if self.finegrained_reduction == 'mean':
             loss = loss / target_mask.sum()
         elif self.finegrained_reduction == 'sum':
             loss = loss
         elif self.finegrained_reduction == 'mean_batch':
-            loss = loss / position_ids.shape[0]
+            loss = loss / batch_size
             raise ValueError(f"Invalid reduction: {self.finegrained_reduction}")
         return loss
 

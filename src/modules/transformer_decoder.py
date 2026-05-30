@@ -30,7 +30,7 @@ class LLMDecoder(nn.Module):
                 if '.mlp.' in name:
                     param.requires_grad = False
 
-    def forward(self, input_ids, position_ids, attn_mask=None, cache=None, cache_position=None):
+    def forward(self, input_ids, position_ids=None, attn_mask=None, cache=None, cache_position=None):
         output = self.prediction(
             input_ids=input_ids, 
             position_ids=position_ids,

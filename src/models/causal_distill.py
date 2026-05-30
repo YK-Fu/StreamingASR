@@ -180,7 +180,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         if self.is_interctc_enabled():
             AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
 
-        _, target, _, _, target_start, target_end, waveform, language_id = batch
+        _, target, _, target_start, target_end, waveform, language_id = batch
         target_len = target_end - target_start
 
         # Do not pass length to the preprocessor, it will be computed in the preprocessor (padding as blank training)
@@ -307,7 +307,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
 
     @torch.no_grad()
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
-        _, target, _, _, target_start, target_end, waveform, language_ids = batch
+        _, target, _, target_start, target_end, waveform, language_ids = batch
         target_len = target_end - target_start
         signal, _ = self.preprocessor(raw_speech=waveform, length=None)
         student_encoded = self.forward(input_signal=signal, language_ids=language_ids)

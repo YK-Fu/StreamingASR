@@ -53,7 +53,6 @@ class ASRDataset(Dataset):
         context: [B, Wc + Wt] - combined context + current transcription token IDs
         target: [B, Wt] - current transcription token IDs
         attn_mask: [B, Wc + Wt] - attention mask (1 for real tokens, 0 for padding)
-        position_ids: [B, Wc + Wt] - position IDs for HF models
         target_start: [B] - start indices of current transcription (after context)
         target_end: [B] - end indices of transcription
         speech: [B, T] - raw waveform
@@ -189,7 +188,7 @@ class ASRDataset(Dataset):
             batch: List of samples from __getitem__
         
         Returns:
-            Tuple of (context, target, attn_mask, position_ids, target_starts, target_ends, waveforms)
+            Tuple of (context, target, attn_mask, target_starts, target_ends, waveforms, language_ids)
         """
         waveforms = [item['waveform'] for item in batch]
         context_list = [item['context'] for item in batch]
@@ -214,11 +213,7 @@ class ASRDataset(Dataset):
         attn_mask[:, 0] = 1     # To prevent the first token to be masked
         # attn_mask[:, -1] = 0    # To prevent the last token to be masked (we do not predict the eos token, so we mask out the last token)
 
-        # Create position IDs
-        batch_size, seq_len = attn_mask.shape
-        position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1).clone()
-
-        return context, target, attn_mask, position_ids, target_starts, target_ends, waveforms, language_ids
+        return context, target, attn_mask, target_starts, target_ends, waveforms, language_ids
 
 class ResumableDataloader(DataLoader):
     def state_dict(self):
