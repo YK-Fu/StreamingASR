@@ -132,26 +132,29 @@ class PrunedRNNTJoint(RNNTJoint):
                 boundary[:, 2] = target_end - 1
                 boundary[:, 3] = encoder_lengths
 
-                # We should always cast the inputs to float32 to prevent numerical instability
-                simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
-                    lm=simple_lm.float(),
-                    am=simple_am.float(),
-                    symbols=symbols,
-                    termination_symbol=blank_symbol,
-                    lm_only_scale=lm_only_scale,
-                    am_only_scale=am_only_scale,
-                    delay_penalty=delay_penalty,
-                    boundary=boundary,
-                    reduction='none',
-                    return_grad=True,
-                )
+                # k2 RNNT kernels are not safe under bf16/fp16 autocast even with
+                # fp32-cast inputs — autocast can still affect internal ops. Disable
+                # autocast around k2 calls (matches icefall's torch_autocast guard).
+                with torch.amp.autocast(device_type='cuda', enabled=False):
+                    simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
+                        lm=simple_lm.float(),
+                        am=simple_am.float(),
+                        symbols=symbols,
+                        termination_symbol=blank_symbol,
+                        lm_only_scale=lm_only_scale,
+                        am_only_scale=am_only_scale,
+                        delay_penalty=delay_penalty,
+                        boundary=boundary,
+                        reduction='none',
+                        return_grad=True,
+                    )
 
-                ranges = k2.get_rnnt_prune_ranges(
-                    px_grad=px_grad,
-                    py_grad=py_grad,
-                    boundary=boundary,
-                    s_range=s_range,
-                )
+                    ranges = k2.get_rnnt_prune_ranges(
+                        px_grad=px_grad,
+                        py_grad=py_grad,
+                        boundary=boundary,
+                        s_range=s_range,
+                    )
 
                 enc_pruned, dec_pruned = k2.do_rnnt_pruning(
                     am=self.project_encoder(encoder_outputs),
@@ -159,16 +162,16 @@ class PrunedRNNTJoint(RNNTJoint):
                     ranges=ranges,
                 )
                 joint = self.forward(enc_pruned, dec_pruned, project_input=False)
-                # We should always cast the inputs to float32 to prevent numerical instability
-                rnnt_loss = k2.rnnt_loss_pruned(
-                    logits=joint.float(),
-                    symbols=symbols,
-                    ranges=ranges,
-                    termination_symbol=blank_symbol,
-                    boundary=boundary,
-                    delay_penalty=delay_penalty,
-                    reduction='none',
-                )
+                with torch.amp.autocast(device_type='cuda', enabled=False):
+                    rnnt_loss = k2.rnnt_loss_pruned(
+                        logits=joint.float(),
+                        symbols=symbols,
+                        ranges=ranges,
+                        termination_symbol=blank_symbol,
+                        boundary=boundary,
+                        delay_penalty=delay_penalty,
+                        reduction='none',
+                    )
                 del joint, ranges, boundary
 
                 # Per-sample finite check (icefall style): compute full batch first,
@@ -176,15 +179,24 @@ class PrunedRNNTJoint(RNNTJoint):
                 # so the computational graph stays connected on all ranks — disconnected
                 # zero tensors cause DDP to hang (find_unused_parameters=False means
                 # DDP waits for every parameter's all-reduce hook to fire).
-                joint_finite = torch.isfinite(simple_loss) & torch.isfinite(rnnt_loss)
-                if not joint_finite.all():
-                    logging.warning(f"{(~joint_finite).sum().item()}/{simple_loss.shape[0]} samples have non-finite loss")
+                # Independent masks per loss: a sample with finite simple_loss but
+                # non-finite rnnt_loss (e.g. s_range pruning missed the true alignment)
+                # still contributes to the simple/CTC path, and vice versa.
+                simple_finite = torch.isfinite(simple_loss)
+                rnnt_finite   = torch.isfinite(rnnt_loss)
+                if not (simple_finite.all() and rnnt_finite.all()):
+                    logging.warning(
+                        f"non-finite samples: simple={(~simple_finite).sum().item()}/{simple_loss.shape[0]}, "
+                        f"rnnt={(~rnnt_finite).sum().item()}/{rnnt_loss.shape[0]}"
+                    )
                 # nan_to_num first: inf * 0 = nan in IEEE 754, which would survive sum()
-                simple_loss = simple_loss.nan_to_num(0.0) * joint_finite
-                rnnt_loss   = rnnt_loss.nan_to_num(0.0) * joint_finite
-                target_tokens = ((target_end - target_start) * joint_finite).sum().clamp(min=1)
-                simple_loss = simple_loss.sum() / target_tokens
-                rnnt_loss   = rnnt_loss.sum() / target_tokens
+                simple_loss = simple_loss.nan_to_num(0.0) * simple_finite
+                rnnt_loss   = rnnt_loss.nan_to_num(0.0) * rnnt_finite
+                target_lens = target_end - target_start
+                simple_tokens = (target_lens * simple_finite).sum().clamp(min=1)
+                rnnt_tokens   = (target_lens * rnnt_finite).sum().clamp(min=1)
+                simple_loss = simple_loss.sum() / simple_tokens
+                rnnt_loss   = rnnt_loss.sum() / rnnt_tokens
             else:
                 simple_loss = None
                 rnnt_loss = None
