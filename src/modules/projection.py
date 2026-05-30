@@ -34,8 +34,10 @@ class SimpleProj(NeuralModule, Exportable):
             assert weights is not None, "weights must be provided if tie_weights is True"
             logits = torch.nn.functional.linear(encoder_output.transpose(1, 2), weights)
         if return_softmax:
-            # cast to float to prevent from spiky logits (stablize training)
-            softmax = torch.nn.functional.log_softmax(logits.float() / self.temperature, dim=-1)
+            # Under Lightning's bf16-mixed autocast, log_softmax is on the fp32-promotion
+            # list — autocast upcasts internally and emits fp32. Explicit .float() is
+            # redundant here and only adds a transient fp32 logits copy at forward peak.
+            softmax = torch.nn.functional.log_softmax(logits / self.temperature, dim=-1)
             if return_logits:
                 return logits, softmax
             else:
