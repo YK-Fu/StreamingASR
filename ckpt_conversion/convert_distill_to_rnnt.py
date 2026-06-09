@@ -120,17 +120,31 @@ def convert_qwen_decoder_weights(
     return converted, lm_head_weight
 
 
+def _strip_orig_mod(key: str) -> str:
+    """Strip torch.compile's '_orig_mod.' prefix anywhere in the key path.
+
+    distiller_train.py wraps both student and teacher with torch.compile when
+    `torch_compile: true` is set in the config — this rewrites their state_dict
+    keys with a `_orig_mod.` infix at the wrap boundary (e.g.,
+    `student._orig_mod.pre_encode.0.weight`). When transferring weights to the
+    plain RNN-T encoder, that infix must be removed or load_state_dict treats
+    all keys as missing/unexpected and leaves the encoder at random init.
+    """
+    return key.replace("_orig_mod.", "")
+
+
 def load_distill_weights_to_rnnt(distill_state, model):
     """
     Load distillation model student weights into RNNT encoder, and ctc_decoder
     weights into the RNNT ctc_decoder.
     """
-    # Extract student encoder weights (remove "student." prefix)
+    # Extract student encoder weights (remove "student." prefix). Also strip any
+    # `_orig_mod.` infix introduced by torch.compile wrapping during distill training.
     print("\n=== Loading student encoder weights into RNNT encoder ===")
     student_encoder_state = {}
     for key, value in distill_state.items():
         if key.startswith("student."):
-            new_key = key[len("student."):]
+            new_key = _strip_orig_mod(key[len("student."):])
             student_encoder_state[new_key] = value
     print(f"Student encoder keys: {len(student_encoder_state)}")
 
@@ -146,24 +160,148 @@ def load_distill_weights_to_rnnt(distill_state, model):
         print(f"  Unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Unexpected keys: {unexpected}")
     print("  Encoder weights loaded successfully")
 
-    # Extract and load CTC decoder weights
+    # Extract and load CTC decoder weights. Strip `_orig_mod.` for safety in case
+    # ctc_decoder is also compiled in a future distill recipe.
     print("\n=== Loading CTC decoder weights ===")
     ctc_decoder_state = {}
     for key, value in distill_state.items():
         if key.startswith("ctc_decoder."):
-            new_key = key[len("ctc_decoder."):]
+            new_key = _strip_orig_mod(key[len("ctc_decoder."):])
             ctc_decoder_state[new_key] = value
 
     if ctc_decoder_state:
         print(f"CTC decoder keys: {len(ctc_decoder_state)}")
-        missing, unexpected = model.ctc_decoder.load_state_dict(ctc_decoder_state, strict=False)
+        # Filter out shape-mismatched keys before load_state_dict — strict=False handles
+        # missing/unexpected keys but still raises on size mismatch for matched keys.
+        # This makes the transfer robust across ProjHead shape changes (e.g. legacy
+        # SimpleProj decoder_layers shape (V, enc_dim) → new ProjHead with hidden_dims
+        # of a different size).
+        target_state = model.ctc_decoder.state_dict()
+        filtered_state = {}
+        shape_mismatched = []
+        for k, v in ctc_decoder_state.items():
+            if k in target_state and target_state[k].shape != v.shape:
+                shape_mismatched.append((k, tuple(v.shape), tuple(target_state[k].shape)))
+            else:
+                filtered_state[k] = v
+        if shape_mismatched:
+            print("  WARNING: shape-mismatched keys (kept at random init):")
+            for k, src_shape, dst_shape in shape_mismatched[:5]:
+                print(f"    {k}: src {src_shape} -> dst {dst_shape}")
+        missing, unexpected = model.ctc_decoder.load_state_dict(filtered_state, strict=False)
         if missing:
             print(f"  Missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Missing keys: {missing}")
         if unexpected:
             print(f"  Unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Unexpected keys: {unexpected}")
-        print("  CTC decoder weights loaded successfully")
+        print(f"  CTC decoder weights loaded ({len(filtered_state)}/{len(ctc_decoder_state)} keys transferred)")
     else:
         print("  No CTC decoder weights found in distillation checkpoint")
+
+
+def init_joint_from_ctc(model):
+    """Initialize the joint from the CTC head, and zero-init project_prednet so
+    the joint behaves approximately like CTC at step 0.
+
+    With a ProjHead CTC head (hidden_dims=[H]: Linear(enc, H) -> SiLU ->
+    Linear(H, V)) and a matching joint (project_encoder Linear + SiLU + final
+    Linear), we copy:
+        ctc_decoder.pre[0]          -> joint.enc                (when joint.enc is Linear)
+        ctc_decoder.decoder_layers  -> joint final Linear
+        joint.pred                  -> zeroed
+    Plus zeroing the joint's biases so the joint output equals CTC's logits at
+    step 0 (exact if joiner activation matches CTC's activation; SiLU on both).
+
+    Falls back gracefully when CTC head is single-layer (hidden_dims=[], legacy
+    SimpleProj) or when joint.enc is Identity (joint_hidden == enc_hidden).
+    """
+    import torch.nn as nn
+
+    # Locate the joint's final Linear (last Linear inside joint_net Sequential).
+    joint_final = None
+    for module in model.joint.joint_net:
+        if isinstance(module, nn.Linear):
+            joint_final = module
+    if joint_final is None:
+        raise RuntimeError("Could not find a Linear inside model.joint.joint_net")
+
+    ctc_final = model.ctc_decoder.decoder_layers  # [V, H_ctc]
+    if joint_final.weight.shape != ctc_final.weight.shape:
+        raise RuntimeError(
+            f"Shape mismatch: joint final Linear weight is {tuple(joint_final.weight.shape)} "
+            f"but CTC final Linear weight is {tuple(ctc_final.weight.shape)}. For CTC-init, "
+            f"set joint_hidden == ctc_decoder.hidden and ensure joint.num_classes+1 == "
+            f"ctc.num_classes."
+        )
+
+    print("\n=== Initializing joint from CTC head ===")
+
+    # Copy CTC final layer -> joint final Linear
+    joint_final.weight.data.copy_(ctc_final.weight)
+    if joint_final.bias is not None:
+        joint_final.bias.data.zero_()
+    print(f"  Copied CTC final weight {tuple(ctc_final.weight.shape)} -> joint final Linear; zeroed bias.")
+
+    # Copy CTC first Linear (inside ProjHead.pre Sequential) -> joint.enc when both
+    # are Linear. ProjHead with hidden_dims=[] has an empty `pre` Sequential and no
+    # first Linear to copy (legacy single-layer CTC behavior).
+    ctc_pre = getattr(model.ctc_decoder, 'pre', None)
+    ctc_project = None
+    if ctc_pre is not None:
+        for module in ctc_pre:
+            if isinstance(module, nn.Linear):
+                ctc_project = module
+                break
+    if ctc_project is None:
+        print(
+            "  CTC head is single-layer (no `pre` Linear); nothing to copy into joint.enc. "
+            "joint.enc left at its initialized values."
+        )
+    elif isinstance(model.joint.enc, nn.Identity):
+        print(
+            "  WARNING: joint.enc is Identity (joint_hidden == enc_hidden) but CTC has a "
+            "project layer — CTC's first transform won't transfer. At step 0 the joint "
+            "output will differ from CTC by approximately SiLU(project(x)) - SiLU(x). "
+            "To enable exact transfer, set joint_hidden != enc_hidden so joint.enc is Linear."
+        )
+    elif model.joint.enc.weight.shape != ctc_project.weight.shape:
+        print(
+            f"  WARNING: joint.enc weight {tuple(model.joint.enc.weight.shape)} mismatches "
+            f"ctc.project weight {tuple(ctc_project.weight.shape)} — skipping project copy."
+        )
+    else:
+        model.joint.enc.weight.data.copy_(ctc_project.weight)
+        if model.joint.enc.bias is not None:
+            if ctc_project.bias is not None:
+                model.joint.enc.bias.data.copy_(ctc_project.bias)
+            else:
+                model.joint.enc.bias.data.zero_()
+        print(f"  Copied CTC project weight {tuple(ctc_project.weight.shape)} -> joint.enc.")
+
+    # Zero project_prednet so the predictor contribution is null at step 0
+    if isinstance(model.joint.pred, nn.Identity):
+        print("  WARNING: project_prednet is Identity — cannot zero predictor contribution.")
+    else:
+        model.joint.pred.weight.data.zero_()
+        if model.joint.pred.bias is not None:
+            model.joint.pred.bias.data.zero_()
+        print(f"  Zero-initialized project_prednet weight {tuple(model.joint.pred.weight.shape)} and bias.")
+
+    joint_act = type(model.joint.joint_net[0]).__name__
+    # Find the first non-Linear module inside ctc_decoder.pre — that's the activation
+    # between the two CTC linears. None if pre is empty (single-layer CTC).
+    ctc_act = 'Identity'
+    if ctc_pre is not None:
+        for module in ctc_pre:
+            if not isinstance(module, nn.Linear):
+                ctc_act = type(module).__name__
+                break
+    if joint_act == ctc_act:
+        print(f"  Joint and CTC both use {joint_act} — CTC-init equivalence is exact at step 0.")
+    else:
+        print(
+            f"  Note: joint activation is {joint_act}, CTC activation is {ctc_act}. "
+            f"CTC-init equivalence is approximate."
+        )
 
 
 def load_qwen_decoder_weights(qwen_path, model):
@@ -188,10 +326,22 @@ def load_qwen_decoder_weights(qwen_path, model):
         print(f"  Decoder unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Decoder unexpected keys: {unexpected}")
     print("  Decoder weights loaded successfully")
     
-    # Load LLM head weights if not tied
+    # Load LLM head weights if not tied. Only valid when ProjHead has hidden_dims=[]
+    # (single Linear); a multi-layer LLM head can't accept a single Qwen lm_head
+    # matrix directly because the input dim differs (the head consumes the last hidden,
+    # not the raw decoder output).
     if lm_head_weight is not None and hasattr(model, 'llm_head') and hasattr(model.llm_head, 'decoder_layers'):
-        model.llm_head.decoder_layers.weight.data.copy_(lm_head_weight)
-        print("  LLM head weights loaded (untied)")
+        dst_shape = tuple(model.llm_head.decoder_layers.weight.shape)
+        src_shape = tuple(lm_head_weight.shape)
+        if dst_shape == src_shape:
+            model.llm_head.decoder_layers.weight.data.copy_(lm_head_weight)
+            print("  LLM head weights loaded (untied)")
+        else:
+            print(
+                f"  WARNING: LLM head shape mismatch (src {src_shape} vs dst {dst_shape}); "
+                f"skipping copy. If llm_head has hidden_dims set, that's expected — the "
+                f"head's pre-layers will stay at random init."
+            )
 
 
 def main():
@@ -232,7 +382,16 @@ def main():
         required=True,
         help="HuggingFace Qwen model path for decoder initialization (optional)"
     )
-    
+
+    parser.add_argument(
+        "--init-joint-from-ctc",
+        action="store_true",
+        help="Initialize the joint's final classifier from the CTC head and "
+             "zero-init project_prednet. Requires joint_hidden == encoder.d_model "
+             "so project_encoder is an Identity. Makes the RNN-T behave approximately "
+             "like CTC at step 0 — a much better starting point than random init."
+    )
+
     args = parser.parse_args()
     
     print("=" * 60)
@@ -263,7 +422,12 @@ def main():
 
     # Load Qwen decoder
     load_qwen_decoder_weights(args.qwen, model)
-    
+
+    # Optionally initialize joint from CTC head (must happen AFTER ctc_decoder
+    # is loaded; it reads ctc_decoder.decoder_layers.weight).
+    if args.init_joint_from_ctc:
+        init_joint_from_ctc(model)
+
     # Save the model
     model.save_to(args.output)
     

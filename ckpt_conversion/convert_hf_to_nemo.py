@@ -268,10 +268,22 @@ def create_rnnt_model_checkpoint(whisper_path, qwen_path, model):
         print(f"  Decoder unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Decoder unexpected keys: {unexpected}")
     print(f"  Decoder weights loaded successfully")
     
-    # Load LLM head weights if not tied
+    # Load LLM head weights if not tied. Only valid when ProjHead has hidden_dims=[]
+    # (single Linear); a multi-layer LLM head can't accept a single Qwen lm_head
+    # matrix directly because the input dim differs (the head consumes the last hidden,
+    # not the raw decoder output).
     if lm_head_weight is not None and hasattr(model, 'llm_head') and hasattr(model.llm_head, 'decoder_layers'):
-        model.llm_head.decoder_layers.weight.data.copy_(lm_head_weight)
-        print(f"  LLM head weights loaded (untied)")
+        dst_shape = tuple(model.llm_head.decoder_layers.weight.shape)
+        src_shape = tuple(lm_head_weight.shape)
+        if dst_shape == src_shape:
+            model.llm_head.decoder_layers.weight.data.copy_(lm_head_weight)
+            print(f"  LLM head weights loaded (untied)")
+        else:
+            print(
+                f"  WARNING: LLM head shape mismatch (src {src_shape} vs dst {dst_shape}); "
+                f"skipping copy. If llm_head has hidden_dims set, that's expected — the "
+                f"head's pre-layers will stay at random init."
+            )
 
 
 def create_distill_model_checkpoint(whisper_path, model):
