@@ -22,11 +22,14 @@ from src.models.causal_distill import CausalWhisperDistilModel
 def main(cfg):
     logging.info(f'Hydra config: {OmegaConf.to_yaml(cfg)}')
     seed_everything(cfg.seed)
+    # Enable TF32 for fp32 matmul ops (most ops are bf16-mixed via autocast, but
+    # on_after_backward gradient norms and reduction paths still benefit).
+    torch.set_float32_matmul_precision('high')
     trainer_cfg = resolve_trainer_cfg(cfg.trainer)
     trainer = pl.Trainer(**trainer_cfg)
     exp_manager(trainer, cfg.get("exp_manager", None))
     asr_model = CausalWhisperDistilModel(cfg=cfg.model, trainer=trainer)
-    
+
     # Initialize the weights of the model from another model, if provided via config
     asr_model.maybe_init_from_pretrained_checkpoint(cfg)
 
@@ -34,6 +37,10 @@ def main(cfg):
         import torch._dynamo
         from nemo.core.classes.common import typecheck
         torch._dynamo.config.suppress_errors = True
+        # Static distill shapes (audio_chunk_step=30, drop_last=True) → just a handful
+        # of graphs (student + teacher + ctc_decoder). 20 gives headroom for val-time
+        # shapes without warnings.
+        torch._dynamo.config.cache_size_limit = 20
         typecheck.set_typecheck_enabled(False)  # prevent wrapt from blocking dynamo tracing
         # No k2 in distillation path and input shape is fixed — use static compilation for
         # maximum kernel specialization. fullgraph=False required because flex_attention's
@@ -41,9 +48,21 @@ def main(cfg):
         # dynamo cannot trace; it graph-breaks there and compiles the surrounding ops.
         # drop_last=True in the dataloader is required to avoid a shape recompilation on
         # the last (smaller) batch of each epoch.
-        logging.info("torch.compile enabled: compiling student and teacher encoders (dynamic=False, fullgraph=False)")
-        asr_model.student = torch.compile(asr_model.student, dynamic=False, fullgraph=False)
-        asr_model.teacher = torch.compile(asr_model.teacher, dynamic=False, fullgraph=False)
+        logging.info(
+            "torch.compile enabled: student/teacher (dynamic=False, max-autotune-no-cudagraphs), "
+            "ctc_decoder (dynamic=False)"
+        )
+        asr_model.student = torch.compile(
+            asr_model.student, dynamic=False, fullgraph=False
+        )
+        asr_model.teacher = torch.compile(
+            asr_model.teacher, dynamic=False, fullgraph=False
+        )
+        # ctc_decoder runs on the static (B, 1280, 750) student output; dynamic=False
+        # gives a fully specialized fused kernel for Linear→SiLU→Linear→log_softmax.
+        asr_model.ctc_decoder = torch.compile(
+            asr_model.ctc_decoder, dynamic=False, fullgraph=True
+        )
 
     gc.freeze()  # Prevent GC from scanning model objects in forked DataLoader workers (CoW mitigation)
     trainer.fit(asr_model)
