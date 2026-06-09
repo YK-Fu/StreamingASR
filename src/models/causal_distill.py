@@ -267,7 +267,13 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         # No self.log here — logging happens in on_validation_epoch_end to avoid
         # Lightning's "same key twice with different arguments" error across dataloaders.
         if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
-            self.validation_step_outputs[dataloader_idx].append(logs)
+            # NeMo's property only initializes per-dataloader sublists on first access if
+            # _validation_dl is already a list>1 at that moment; and our epoch-end resets
+            # the cache. Lazy-extend here so dataloader_idx is always valid.
+            outputs = self.validation_step_outputs
+            while len(outputs) <= dataloader_idx:
+                outputs.append([])
+            outputs[dataloader_idx].append(logs)
         else:
             self.validation_step_outputs.append(logs)
         return logs
