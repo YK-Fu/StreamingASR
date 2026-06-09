@@ -6,13 +6,13 @@ model:
   sample_rate: 16000
   compute_eval_loss: false # eval samples can be very long and exhaust memory. Disable computation of transducer loss during validation/testing with this flag.
   log_prediction: true # enables logging sample predictions in the output during training
-  skip_nan_grad: false
-  use_cer: false
+  skip_nan_grad: true
+  use_cer: true
 
   model_defaults:
     enc_hidden: ${model.encoder.d_model}
-    pred_hidden: 640
-    joint_hidden: 640
+    pred_hidden: ${model.decoder.config.hidden_size}
+    joint_hidden: 690
 
   train_ds:
     manifest_filepath:    # Path to jsonl file containing the training data
@@ -119,8 +119,9 @@ model:
 
     # Simple projection layer for pruned RNN-T loss.
     projection:
-      _target_: src.modules.projection.SimpleProj
+      _target_: src.modules.projection.ProjHead
       feat_in: ${model.decoder.config.hidden_size}
+      hidden_dims: []  # [] = single Linear (legacy SimpleProj); add hidden sizes for an MLP head
       tie_weights: false # Set to true to tie the weights of the projection layer with decoder output head. This reduces the parameter count of the model.
       num_classes: -1
 
@@ -135,27 +136,30 @@ model:
 
     jointnet:
       joint_hidden: ${model.model_defaults.joint_hidden}
-      activation: "relu"
+      activation: "silu"
       dropout: 0.2
 
   decoding:
     strategy: "LoopLabel" # Choose between LoopLabel and LoopFrame
-    max_length: 10
-    max_symbols_per_step: 5
+    max_length: 128
+    max_symbols_per_step: 3
 
     # greedy strategy config
     greedy:
-      max_symbols: 10
+      max_symbols: 128
   aux_llm:
-    llm_loss_weight: 0.2
+    llm_loss_weight: 0.1
 
   # The section which would contain the decoder and decoding configs of the auxiliary CTC decoder
   aux_ctc:
-    ctc_loss_weight: 0.2 # the weight used to combine the CTC loss with the RNNT loss
+    ctc_loss_weight: 0.3 # the weight used to combine the CTC loss with the RNNT loss
     use_cer: true
     decoder:
-      _target_: src.modules.projection.SimpleProj
+      _target_: src.modules.projection.ProjHead
       feat_in: ${model.encoder.d_model}
+      hidden_dims: 
+        - ${model.model_defaults.joint_hidden}  # two-layer head matching joiner's (project_encoder, final) structure
+      activation: silu
       num_classes: -1
     decoding:
       strategy: "greedy_batch"    # "greedy", "greedy_batch", "beam", "pyctcdecode", "flashlight", "wfst", 
@@ -172,13 +176,13 @@ model:
   loss:
     lm_only_scale: 0.25
     am_only_scale: 0.0
-    delay_penalty: 0.0    # keep at 0 until model converges; icefall disables during warmup
-    s_range: 3            # pruned RNN-T loss: how many symbols to keep for each frame. (reduce a lot of memory and training time)
+    delay_penalty: 0.05    # keep at 0 until model converges; icefall disables during warmup
+    s_range: 4            # pruned RNN-T loss: how many symbols to keep for each frame. (reduce a lot of memory and training time)
     loss_warm_steps: 5000 # steps to ramp rnnt_loss_weight 0.1→1.0, decoupled from LR warmup
 
   optim:
     name: adamw_8bit
-    lr: 5e-4
+    lr: 1e-4
     eps: 1e-8
     # optimizer arguments
     betas: [ 0.9, 0.98 ]
