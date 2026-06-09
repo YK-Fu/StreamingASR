@@ -11,28 +11,88 @@ try:
 except ImportError:
     logging.warning("k2 is not installed, RNN-T training will be disabled")
 
-class SimpleProj(NeuralModule, Exportable):
-    def __init__(self, feat_in, num_classes, init_mode="xavier_uniform", vocabulary=None, tie_weights=False):
+_ACTIVATIONS = {
+    'silu':    lambda: torch.nn.SiLU(inplace=True),
+    'swish':   lambda: torch.nn.SiLU(inplace=True),
+    'relu':    lambda: torch.nn.ReLU(inplace=True),
+    'tanh':    lambda: torch.nn.Tanh(),
+    'sigmoid': lambda: torch.nn.Sigmoid(),
+    'gelu':    lambda: torch.nn.GELU(),
+}
+
+
+def _make_activation(name):
+    name = name.lower()
+    if name not in _ACTIVATIONS:
+        raise ValueError(f"Unsupported activation: {name}. Choose from {sorted(_ACTIVATIONS)}")
+    return _ACTIVATIONS[name]()
+
+
+class ProjHead(NeuralModule, Exportable):
+    """Configurable MLP projection head:
+
+        encoder_output (B, D, T)
+          -> transpose to (B, T, D)
+          -> [Linear(D, h_1) -> act] -> ... -> [Linear(h_{k-1}, h_k) -> act]
+          -> Linear(h_k, num_classes)   # named `decoder_layers`, bias=False
+
+    Configuration via ``hidden_dims`` (list of ints):
+        []         -> single Linear (legacy SimpleProj behavior)
+        [H]        -> Linear -> act -> Linear (legacy TwoLayerProj behavior)
+        [H1, H2]   -> three Linears, etc.
+
+    The final Linear is always named ``decoder_layers`` (bias=False) so that
+    existing CTC-init scripts and SimpleProj checkpoints continue to load —
+    when ``hidden_dims=[]``, the entire state_dict matches the old SimpleProj
+    keys exactly.
+
+    Pre-layers live under ``pre`` (an ``nn.Sequential``). With ``hidden_dims=[]``
+    this is an empty Sequential acting as identity (no params, no state_dict keys).
+
+    Args:
+        feat_in:     input feature dim (D).
+        num_classes: output vocab size.
+        hidden_dims: list of intermediate hidden dims (default: []).
+        activation:  one of [silu, swish, relu, tanh, sigmoid, gelu] (default: silu).
+        tie_weights: if True, the final Linear's weight is provided externally to
+                     forward() (used for weight-tied LM heads).
+    """
+
+    def __init__(self, feat_in, num_classes, hidden_dims=None, activation='silu',
+                 init_mode='xavier_uniform', vocabulary=None, tie_weights=False):
         super().__init__()
         self.__vocabulary = vocabulary
         self._feat_in = feat_in
         self._num_classes = num_classes
         self.tie_weights = tie_weights
+
+        hidden_dims = list(hidden_dims) if hidden_dims else []
+        self._hidden_dims = hidden_dims
+
+        pre_layers = []
+        prev = feat_in
+        for h in hidden_dims:
+            pre_layers.append(torch.nn.Linear(prev, h))
+            pre_layers.append(_make_activation(activation))
+            prev = h
+        self.pre = torch.nn.Sequential(*pre_layers)  # empty Sequential is a valid identity
+
         if not self.tie_weights:
-            self.decoder_layers = torch.nn.Linear(self._feat_in, self._num_classes, bias=False)
+            self.decoder_layers = torch.nn.Linear(prev, num_classes, bias=False)
 
-            self.apply(lambda x: init_weights(x, mode=init_mode))
-
+        self.apply(lambda x: init_weights(x, mode=init_mode))
         # to change, requires running ``model.temperature = T`` explicitly
         self.temperature = 1.0
 
     def forward(self, encoder_output, return_logits=False, return_softmax=True, weights=None):
         assert return_logits or return_softmax, "Either return_logits or return_softmax must be True"
+        # (B, D, T) -> (B, T, D) -> pre -> (B, T, H_last) -> final Linear -> (B, T, V)
+        x = self.pre(encoder_output.transpose(1, 2))
         if not self.tie_weights:
-            logits = self.decoder_layers(encoder_output.transpose(1, 2))
+            logits = self.decoder_layers(x)
         else:
             assert weights is not None, "weights must be provided if tie_weights is True"
-            logits = torch.nn.functional.linear(encoder_output.transpose(1, 2), weights)
+            logits = torch.nn.functional.linear(x, weights)
         if return_softmax:
             # Under Lightning's bf16-mixed autocast, log_softmax is on the fp32-promotion
             # list — autocast upcasts internally and emits fp32. Explicit .float() is
@@ -50,7 +110,57 @@ class SimpleProj(NeuralModule, Exportable):
         return self._num_classes
 
 
+# Back-compat alias — old distill .nemo checkpoints have `_target_:
+# src.modules.projection.SimpleProj` baked into their saved config. SimpleProj's
+# original __init__ signature (feat_in, num_classes, init_mode, vocabulary,
+# tie_weights) is a strict subset of ProjHead's, so existing restores still work
+# (hidden_dims defaults to [], reproducing single-Linear behavior). New configs
+# should use ProjHead directly.
+SimpleProj = ProjHead
+
+
 class PrunedRNNTJoint(RNNTJoint):
+    def _joint_net_modules(self, num_classes, pred_n_hidden, enc_n_hidden, joint_n_hidden, activation, dropout):
+        """Override NeMo's _joint_net_modules to:
+
+        1. Skip the encoder / predictor projection (use nn.Identity) when its input
+           dim already matches joint_n_hidden. Saves a Linear's worth of params,
+           compute, and activation memory whenever the dims happen to line up.
+        2. Accept 'silu' (a.k.a. swish) in addition to NeMo's [relu, tanh, sigmoid].
+           SiLU is the default modern transformer activation (used by Llama, Qwen,
+           PaLM, etc.) — typically matches or slightly beats ReLU/Tanh on RNN-T joints.
+        """
+        if pred_n_hidden == joint_n_hidden:
+            pred = torch.nn.Identity()
+        else:
+            pred = torch.nn.Linear(pred_n_hidden, joint_n_hidden)
+        if enc_n_hidden == joint_n_hidden:
+            enc = torch.nn.Identity()
+        else:
+            enc = torch.nn.Linear(enc_n_hidden, joint_n_hidden)
+
+        activation = activation.lower()
+        if activation == 'relu':
+            act = torch.nn.ReLU(inplace=True)
+        elif activation == 'sigmoid':
+            act = torch.nn.Sigmoid()
+        elif activation == 'tanh':
+            act = torch.nn.Tanh()
+        elif activation == 'silu' or activation == 'swish':
+            act = torch.nn.SiLU(inplace=True)
+        else:
+            raise ValueError(
+                "Unsupported activation for joint step - please pass one of "
+                "[relu, sigmoid, tanh, silu]"
+            )
+
+        layers = (
+            [act]
+            + ([torch.nn.Dropout(p=dropout)] if dropout else [])
+            + [torch.nn.Linear(joint_n_hidden, num_classes)]
+        )
+        return pred, enc, torch.nn.Sequential(*layers)
+
     def forward(self, f, g, project_input=True):
         if project_input:
             return self.joint_after_projection(self.project_encoder(f), self.project_prednet(g), log_softmax=not self.training)
