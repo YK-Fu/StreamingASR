@@ -343,6 +343,24 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         else:
             llm_loss = 0
 
+        # Icefall-style discrete warmup: keep pruned_loss off entirely until the
+        # smoothed-loss path has trained simple_am_proj (= ctc_decoder) enough that
+        # k2.get_rnnt_prune_ranges covers the true alignment. Phase 1 (warmup<1):
+        # simple only. Phase 2 (1<=warmup<2): 10% pruned. Phase 3: full pruned,
+        # reduced simple.
+        loss_warm_steps = self.cfg.loss.get("loss_warm_steps", self.cfg.optim.sched.warmup_steps)
+        warmup = self.trainer.global_step / max(loss_warm_steps, 1)
+        if warmup < 1.0:
+            simple_loss_weight, rnnt_loss_weight = 1.0, 0.0
+        elif warmup < 2.0:
+            simple_loss_weight, rnnt_loss_weight = 1.0, 0.1
+        else:
+            simple_loss_weight, rnnt_loss_weight = 0.5, 1.0
+        # Only enable delay_penalty once the alignment is well-learned. Applying it
+        # earlier biases emission timing against an unreliable alignment and inflates
+        # the negative-loss magnitude before WER has converged.
+        delay_penalty = self.cfg.loss.get("delay_penalty", 0.0) if warmup >= 10.0 else 0.0
+
         # Fused joint step
         simple_loss, rnnt_loss, wer, _, _ = self.joint.forward_fused_loss(
             encoder_outputs=encoded,
@@ -352,7 +370,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             am_only_scale=self.cfg.loss.get("am_only_scale", 0.0),
             lm_only_scale=self.cfg.loss.get("lm_only_scale", 0.25),
             s_range=self.cfg.loss.get("s_range", 5),
-            delay_penalty=self.cfg.loss.get("delay_penalty", 0.0),
+            delay_penalty=delay_penalty,
             blank_symbol=self.blank_id,
             encoder_lengths=encoded_len,
             transcripts=context,
@@ -380,20 +398,6 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         if compute_wer:
             tensorboard_logs.update({'training_batch_wer': wer.detach()})
-
-        # Icefall-style discrete warmup: keep pruned_loss off entirely until the
-        # smoothed-loss path has trained simple_am_proj (= ctc_decoder) enough that
-        # k2.get_rnnt_prune_ranges covers the true alignment. Phase 1 (warmup<1):
-        # simple only. Phase 2 (1<=warmup<2): 10% pruned. Phase 3: full pruned,
-        # reduced simple.
-        loss_warm_steps = self.cfg.loss.get("loss_warm_steps", self.cfg.optim.sched.warmup_steps)
-        warmup = self.trainer.global_step / max(loss_warm_steps, 1)
-        if warmup < 1.0:
-            simple_loss_weight, rnnt_loss_weight = 1.0, 0.0
-        elif warmup < 2.0:
-            simple_loss_weight, rnnt_loss_weight = 1.0, 0.1
-        else:
-            simple_loss_weight, rnnt_loss_weight = 0.5, 1.0
         if self.ctc_loss_weight > 0:
             ctc_loss = self.ctc_loss(
                 log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_end - target_start
