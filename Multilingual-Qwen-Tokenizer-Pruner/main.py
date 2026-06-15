@@ -6,14 +6,137 @@ and optional per-file rare token filtering.
 """
 
 import os
+import json
 import argparse
+import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from vocab_count import count_freq, count_recursive_parallel
-from vocab_save import get_new_vocab_and_map, save_vocab, reduce_to_target_size, filter_long_tokens, filter_multichar_cjk_tokens
+from vocab_count import count_freq, count_recursive_parallel, scan_cjk_chars
+from vocab_save import get_new_vocab_and_map, save_vocab, reduce_to_target_size, filter_long_tokens, filter_multichar_cjk_tokens, _get_byte_encoder
 from model_save import saving_updated_qwen, saving_updated_qwenvl
 from utils import load_vocabulary_bytes
+
+
+def load_tokenizer_internals(old_model_path):
+    """Return (str2id, id2str, merge_parent) from the original tokenizer.json.
+
+    merge_parent maps each merged token string -> (a_str, b_str), the unique pair
+    whose concatenation produces it (byte-level BPE creates one token per merge).
+    """
+    with open(os.path.join(old_model_path, 'tokenizer.json'), 'r', encoding='utf-8') as f:
+        tj = json.load(f)
+    str2id = tj['model']['vocab']                 # byte-level str -> old id
+    id2str = {v: k for k, v in str2id.items()}
+    merge_parent = {}
+    for mg in tj['model']['merges']:
+        a, b = (mg.split(' ') if isinstance(mg, str) else (mg[0], mg[1]))
+        merge_parent[a + b] = (a, b)
+    return str2id, id2str, merge_parent
+
+
+def force_keep_closure(token_str, merge_parent, str2id, vocab_counts, recur_counts):
+    """Force-keep token_str and every token on its byte-level merge path (down to
+    bytes), so the BPE merge path survives pruning and the token stays reachable."""
+    stack = [token_str]
+    while stack:
+        t = stack.pop()
+        tid = str2id.get(t)
+        if tid is not None and vocab_counts[tid] + recur_counts[tid] == 0:
+            vocab_counts[tid] = 1
+        if t in merge_parent:
+            stack.extend(merge_parent[t])
+
+
+def select_per_language_keep(per_lang_counts, alive_mask, max_size):
+    """Keep at most `max_size` tokens per language (its top-N by its own counts,
+    restricted to tokens that survived earlier filters via alive_mask), unioned
+    across languages.
+
+    Returns (keep_ids set, info dict of stem -> kept count).
+    """
+    keep, info = set(), {}
+    for stem, counts in per_lang_counts.items():
+        c = counts.astype(np.float64) * alive_mask
+        order = np.argsort(c)[::-1]
+        n_nz = int((c[order] > 0).sum())
+        K = min(max_size, n_nz)
+        keep.update(int(i) for i in order[:K])
+        info[stem] = K
+    return keep, info
+
+
+def prepare_native_char_tokens(chars, old_tokenizer, internals, vocab_counts, recur_counts):
+    """Guarantee every char in `chars` is a single *native BPE* token in the pruned model.
+
+    Two cases per character (no added tokens are used):
+      - Already one token in original Qwen: force-keep its full merge-decomposition
+        closure (the token + every intermediate token down to bytes) so the byte-level
+        merge path survives pruning and BPE rebuilds it. Original id/embedding reused.
+      - Splits into k>1 tokens: fold the fragments left-to-right into the char token,
+        creating k-1 new vocab entries (k-2 intermediates + the char) and k-1 new
+        merges appended at lowest priority. Each new entry's embedding is the mean of
+        the original-Qwen fragment rows it spans.
+
+    vocab_counts/recur_counts are bumped in place to force-keep needed tokens.
+
+    Returns (native_tokens, native_merges):
+      native_tokens: ordered list of NEW BPE vocab entries to append:
+          {"str": <byte-level token string>,
+           "init_ids": [old_ids whose embedding rows to average]}
+      native_merges: ordered, de-duplicated list of [a_str, b_str] merge rules to
+          append at lowest priority so BPE rebuilds each native token.
+    """
+    str2id, id2str, merge_parent = internals
+
+    def keep_closure(token_str):
+        force_keep_closure(token_str, merge_parent, str2id, vocab_counts, recur_counts)
+
+    # Force-keep all 256 base byte tokens so the tokenizer stays byte-level OOV-free
+    # (the pruner otherwise drops unused byte tokens, breaking rare bytes/scripts).
+    n_bytes = 0
+    for byte_char in _get_byte_encoder().values():
+        bid = str2id.get(byte_char)
+        if bid is not None and vocab_counts[bid] + recur_counts[bid] == 0:
+            vocab_counts[bid] = 1
+            n_bytes += 1
+    print(f"==> Force-kept {n_bytes} previously-unused base byte tokens (OOV-free)")
+
+    print(f"==> Guaranteeing native single-token representation for {len(chars):,} characters")
+    native_tokens, native_merges = [], []
+    seen_new, seen_merge = set(), set()
+    n_keep = n_two = n_three = 0
+    for ch in chars:
+        ids = old_tokenizer.encode(ch, add_special_tokens=False)
+        if not ids:
+            continue
+        strs = [id2str[i] for i in ids]
+        for s in strs:                           # make every fragment reachable
+            keep_closure(s)
+        if len(ids) == 1:
+            n_keep += 1
+            continue
+        # Left-fold fragments into the char token, adding a merge (and a new vocab
+        # entry for each not-yet-existing intermediate / the char itself).
+        cur, cur_ids = strs[0], [ids[0]]
+        for j in range(1, len(strs)):
+            nxt, nxt_ids = cur + strs[j], cur_ids + [ids[j]]
+            if (cur, strs[j]) not in seen_merge:
+                native_merges.append([cur, strs[j]])
+                seen_merge.add((cur, strs[j]))
+            if nxt in str2id:
+                keep_closure(nxt)                # existing token: retain it
+            elif nxt not in seen_new:
+                native_tokens.append({'str': nxt, 'init_ids': list(nxt_ids)})
+                seen_new.add(nxt)
+            cur, cur_ids = nxt, nxt_ids
+        n_two += (len(ids) == 2)
+        n_three += (len(ids) >= 3)
+    print(f"   already native single token : {n_keep:,}")
+    print(f"   2-token chars merged (native): {n_two:,}")
+    print(f"   3+-token chars merged (native): {n_three:,}")
+    print(f"   new native vocab entries: {len(native_tokens):,}  new merges: {len(native_merges):,}")
+    return native_tokens, native_merges
 
 
 def main():
@@ -30,7 +153,12 @@ def main():
     parser.add_argument('--inherit_vocab_count', type=str, default=None,
                         help='Path to existing vocab_counts.torch to inherit from')
     parser.add_argument('--target_size', type=int, default=None,
-                        help='Target vocabulary size (optional)')
+                        help='Global target vocabulary size (optional)')
+    parser.add_argument('--per_lang_target_size', type=int, default=None,
+                        help='Maximum vocab size PER LANGUAGE (instead of a global --target_size). '
+                             'Each language keeps at most this many of its most frequent tokens; '
+                             'the kept sets are unioned. Requires --support_data. CJK char / byte / '
+                             'special tokens are kept on top of this budget.')
     parser.add_argument('--filter_rare_percentile', type=float, default=None,
                         help='Zero out bottom X%% of tokens per file (e.g., 5 for 5%%)')
     parser.add_argument('--num_workers', type=int, default=16,
@@ -42,7 +170,9 @@ def main():
     parser.add_argument('--max_token_length', type=int, default=None,
                         help='Filter out tokens with more than N bytes/characters (e.g., 10)')
     parser.add_argument('--filter_multichar_cjk', action='store_true',
-                        help='Remove CJK tokens longer than 1 character (keep only single-char CJK)')
+                        help='CJK char-level mode: (1) remove CJK tokens longer than 1 character, '
+                             'and (2) guarantee every CJK-family character in --support_data is a '
+                             'single native BPE token (merging sub-tokens with averaged embeddings).')
     parser.add_argument('--add_special_tokens', type=str, default=None,
                         help='Path to text file with new special tokens to add (one per line)')
     args = parser.parse_args()
@@ -125,17 +255,53 @@ def main():
             old_bytes_list=old_bytes_list
         )
 
-    # Reduce vocab to target size if specified
-    if args.target_size is not None:
+    # Per-language budgeting (--per_lang_target_size): keep top-K tokens per language
+    # (by that language's own counts) + their merge closures, instead of a global cut.
+    internals = load_tokenizer_internals(args.old_model_path)
+    if args.per_lang_target_size is not None:
+        if args.support_data is None:
+            raise ValueError("--per_lang_target_size requires --support_data (per-language counts)")
+        if args.target_size is not None:
+            raise ValueError("Use either --target_size or --per_lang_target_size, not both")
+        print(f"==> Max vocab size per language: {args.per_lang_target_size:,}")
+        per_lang_counts = dict(np.load(os.path.join(args.new_model_path, 'per_lang_counts.npz')))
+        alive_mask = (np.array(vocab_counts, dtype=np.int64) > 0).astype(np.float64)
+        keep_ids, info = select_per_language_keep(per_lang_counts, alive_mask,
+                                                  args.per_lang_target_size)
+        for stem in sorted(info):
+            print(f"   {stem:<8} keep top {info[stem]:,}")
+        # Rewrite counts to keep only the selected ids + their merge closures.
+        str2id, id2str, merge_parent = internals
+        vocab_counts = [0] * old_vocab_size
+        recur_counts = [0] * old_vocab_size
+        for tid in keep_ids:
+            vocab_counts[tid] = 1
+        for tid in keep_ids:
+            s = id2str.get(tid)
+            if s is not None:
+                force_keep_closure(s, merge_parent, str2id, vocab_counts, recur_counts)
+        print(f"   selected {len(keep_ids):,} tokens, {sum(1 for c in vocab_counts if c>0):,} after merge-closure")
+    elif args.target_size is not None:
+        # Reduce vocab to a global target size
         print(f"==> Reducing vocab to target size: {args.target_size:,}")
         vocab_counts, recur_counts = reduce_to_target_size(
-            old_vocab_size=old_vocab_size, 
-            target_vocab_size=args.target_size, 
-            vocab_counts=vocab_counts, 
-            recur_counts=recur_counts, 
+            old_vocab_size=old_vocab_size,
+            target_vocab_size=args.target_size,
+            vocab_counts=vocab_counts,
+            recur_counts=recur_counts,
             old_bytes_list=old_bytes_list
         )
-    
+
+    # CJK char-level mode (driven by --filter_multichar_cjk): guarantee every
+    # CJK-family character in the support data is a single native BPE token.
+    native_tokens, native_merges = [], []
+    if args.filter_multichar_cjk and args.support_data is not None:
+        cjk_chars = scan_cjk_chars(args.support_data, num_workers=args.num_workers)
+        native_tokens, native_merges = prepare_native_char_tokens(
+            cjk_chars, old_tokenizer, internals, vocab_counts, recur_counts)
+    native_token_strs = [t['str'] for t in native_tokens]
+    merge_init = [t['init_ids'] for t in native_tokens]
+
     # Read extra special tokens file if provided
     extra_special_tokens = []
     if args.add_special_tokens is not None:
@@ -146,33 +312,38 @@ def main():
     # Get new vocabulary and mapping
     print(f"==> Building new vocabulary")
     new_bytes_list, mapping_new2old = get_new_vocab_and_map(
-        old_bytes_list=old_bytes_list, 
+        old_bytes_list=old_bytes_list,
         old_vocab_size=old_vocab_size,
-        vocab_counts=vocab_counts, 
+        vocab_counts=vocab_counts,
         recur_counts=recur_counts,
         old_tokenizer=old_tokenizer,
         only_essential_special_tokens=True  # Only BOS, EOS, PAD
     )
-    new_vocab_size = len(mapping_new2old) + len(extra_special_tokens)
-    
+    # Appended id layout: [mapped][extra_special][native merged-char tokens]
+    new_vocab_size = len(mapping_new2old) + len(extra_special_tokens) + len(native_token_strs)
+
     # Save vocabulary files
     save_vocab(
-        new_bytes_list, 
-        mapping_new2old, 
-        args.new_model_path, 
-        tokenizer_format=tokenizer_format, 
+        new_bytes_list,
+        mapping_new2old,
+        args.new_model_path,
+        tokenizer_format=tokenizer_format,
         old_tokenizer=old_tokenizer,
-        extra_special_tokens=extra_special_tokens
+        extra_special_tokens=extra_special_tokens,
+        native_tokens=native_token_strs,
+        native_merges=native_merges
     )
 
     # Update and save model checkpoint
     print(f"==> Updating model checkpoint")
     if 'visual' in old_model.config.__dict__:
         print(f"  Detected Qwen-VL model")
-        saving_updated_qwenvl(old_model, new_vocab_size, mapping_new2old, args.new_model_path)
+        saving_updated_qwenvl(old_model, new_vocab_size, mapping_new2old, args.new_model_path,
+                              num_extra_special=len(extra_special_tokens), merge_init=merge_init)
     else:
         print(f"  Detected standard Qwen model")
-        saving_updated_qwen(old_model, new_vocab_size, mapping_new2old, args.new_model_path)
+        saving_updated_qwen(old_model, new_vocab_size, mapping_new2old, args.new_model_path,
+                            num_extra_special=len(extra_special_tokens), merge_init=merge_init)
     
     print(f"\n{'='*50}")
     print(f"Vocabulary pruning complete!")
@@ -180,6 +351,8 @@ def main():
     print(f"  New size:      {new_vocab_size:,}")
     if extra_special_tokens:
         print(f"    (includes {len(extra_special_tokens)} extra special tokens)")
+    if native_token_strs:
+        print(f"    (includes {len(native_token_strs)} native merged CJK-char tokens)")
     print(f"  Reduction:     {old_vocab_size - new_vocab_size:,} tokens ({100*(old_vocab_size-new_vocab_size)/old_vocab_size:.1f}%)")
     print(f"  Output path:   {args.new_model_path}")
     print(f"{'='*50}")

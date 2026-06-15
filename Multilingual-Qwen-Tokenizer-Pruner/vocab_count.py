@@ -201,6 +201,7 @@ def count_freq(data_path: str, vocab_size: int, tokenizer_path: str,
         print(f"Per-file filtering: removing bottom {filter_rare_percentile}% rare tokens")
     
     # Reuse executor across files to save memory
+    per_lang_counts = {}   # file stem -> per-language token counts (for --per_lang_target_size)
     ctx = mp.get_context('spawn')
     with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
         for path in tqdm(files, desc="Processing files"):
@@ -214,7 +215,11 @@ def count_freq(data_path: str, vocab_size: int, tokenizer_path: str,
                 executor=executor,
                 filter_rare_percentile=filter_rare_percentile
             )
+            per_lang_counts[os.path.splitext(path)[0]] = file_counts.copy()
             vocab_counts += file_counts
+
+    # Save per-language counts for per-language budgeting (--per_lang_target_size)
+    np.savez(os.path.join(output_path, 'per_lang_counts.npz'), **per_lang_counts)
 
     # Add inherited vocab counts if provided
     if inherit_vocab_count is not None:
@@ -230,6 +235,53 @@ def count_freq(data_path: str, vocab_size: int, tokenizer_path: str,
     # Save vocab_counts (convert to list for compatibility)
     torch.save(vocab_counts.tolist(), os.path.join(output_path, 'vocab_counts.torch'))
     return vocab_counts.tolist()
+
+
+def _scan_chars_batch(lines):
+    """Return the set of CJK-family characters appearing in a batch of JSONL lines."""
+    from vocab_save import is_cjk_family
+    found = set()
+    for line in lines:
+        try:
+            data = json.loads(line)
+        except Exception:
+            continue
+        text = data.get('text') or data.get('sentence') or ''
+        for ch in text:
+            if ch not in found and is_cjk_family(ch):
+                found.add(ch)
+    return found
+
+
+def scan_cjk_chars(data_path, batch_size=20000, num_workers=16):
+    """Scan all *.jsonl in data_path and return the sorted set of CJK-family chars.
+
+    Used (with --filter_multichar_cjk) to decide which characters must become a
+    single native token. Cheap relative to tokenization: just a per-char range test.
+    """
+    files = [os.path.join(data_path, f) for f in os.listdir(data_path)
+             if f.endswith('.jsonl')]
+
+    def batch_generator():
+        batch = []
+        for path in files:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    batch.append(line)
+                    if len(batch) >= batch_size:
+                        yield batch
+                        batch = []
+        if batch:
+            yield batch
+
+    chars = set()
+    ctx = mp.get_context('spawn')
+    with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
+        for found in tqdm(executor.map(_scan_chars_batch, batch_generator()),
+                          desc="Scanning CJK chars"):
+            chars |= found
+    print(f"Found {len(chars):,} unique CJK-family characters in {data_path}")
+    return sorted(chars)
 
 
 def _process_recursive_chunk(args):

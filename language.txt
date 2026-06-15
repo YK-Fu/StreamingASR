@@ -1,16 +1,9 @@
 <|NO_LANGUAGE_ID|>
-<|DE|>
 <|EN|>
-<|ES|>
-<|FR|>
-<|HI|>
 <|ID|>
-<|IT|>
 <|JA|>
 <|KO|>
 <|NAN|>
-<|NL|>
-<|PT|>
 <|RU|>
 <|TH|>
 <|VI|>

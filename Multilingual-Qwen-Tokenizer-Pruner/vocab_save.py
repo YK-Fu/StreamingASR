@@ -48,6 +48,23 @@ def _is_cjk_character(char):
     )
 
 
+def is_cjk_family(char):
+    """Broader CJK-family test for char-level single-token guarantees: Han ideographs
+    plus Hiragana/Katakana, Hangul, CJK symbols & punctuation, and fullwidth forms.
+    """
+    cp = ord(char)
+    return (
+        _is_cjk_character(char)
+        or (0x3040 <= cp <= 0x30FF)    # Hiragana + Katakana
+        or (0x31F0 <= cp <= 0x31FF)    # Katakana phonetic extensions
+        or (0xAC00 <= cp <= 0xD7A3)    # Hangul syllables
+        or (0x1100 <= cp <= 0x11FF)    # Hangul Jamo
+        or (0x3130 <= cp <= 0x318F)    # Hangul compatibility Jamo
+        or (0x3000 <= cp <= 0x303F)    # CJK symbols & punctuation
+        or (0xFF00 <= cp <= 0xFFEF)    # halfwidth & fullwidth forms
+    )
+
+
 def filter_multichar_cjk_tokens(vocab_counts, recur_counts, old_bytes_list):
     """
     Zero out CJK tokens that contain more than 1 character.
@@ -167,10 +184,11 @@ def get_new_vocab_and_map(old_bytes_list, old_vocab_size, vocab_counts, recur_co
 
 
 def save_vocab(bytes_list, token_mapping, output_path, tokenizer_format='tiktoken',
-               old_tokenizer=None, extra_special_tokens=None):
+               old_tokenizer=None, extra_special_tokens=None,
+               native_tokens=None, native_merges=None):
     """
     Save vocabulary in the appropriate format.
-    
+
     Args:
         bytes_list: List of byte sequences for each token
         token_mapping: Mapping from new token IDs to old token IDs
@@ -178,9 +196,18 @@ def save_vocab(bytes_list, token_mapping, output_path, tokenizer_format='tiktoke
         tokenizer_format: 'tiktoken' or 'huggingface'
         old_tokenizer: Original HuggingFace tokenizer (needed for HuggingFace format)
         extra_special_tokens: List of new special token strings to append (e.g. ["<|zh|>", "<|en|>"])
+        native_tokens: List of new NON-special token strings (merged CJK chars +
+            intermediates) appended to the BPE vocab after the special tokens. These
+            are real BPE entries (not added tokens) — produced via native_merges.
+        native_merges: List of [a_str, b_str] merge rules appended (lowest priority)
+            so the byte-level BPE rebuilds each native token.
     """
     if extra_special_tokens is None:
         extra_special_tokens = []
+    if native_tokens is None:
+        native_tokens = []
+    if native_merges is None:
+        native_merges = []
 
     token_mapping_path = os.path.join(output_path, 'token_mapping.torch')
     
@@ -203,7 +230,8 @@ def save_vocab(bytes_list, token_mapping, output_path, tokenizer_format='tiktoke
     # Save HuggingFace format if original was HuggingFace
     if tokenizer_format == 'huggingface' and old_tokenizer is not None:
         save_vocab_huggingface(bytes_list, token_mapping, output_path, old_tokenizer,
-                               extra_special_tokens=extra_special_tokens)
+                               extra_special_tokens=extra_special_tokens,
+                               native_tokens=native_tokens, native_merges=native_merges)
 
     # Save mapping index
     torch.save(torch.LongTensor(token_mapping), token_mapping_path)
@@ -230,17 +258,24 @@ def _get_byte_encoder():
 
 
 def save_vocab_huggingface(bytes_list, token_mapping, output_path, old_tokenizer,
-                           only_bos_eos=True, extra_special_tokens=None):
+                           only_bos_eos=True, extra_special_tokens=None,
+                           native_tokens=None, native_merges=None):
     """
     Save vocabulary in HuggingFace tokenizer format.
     Updates tokenizer.json with the new pruned vocabulary.
-    
+
     Args:
         only_bos_eos: If True, only add BOS and EOS as special tokens, remove all others.
         extra_special_tokens: List of new special token strings to append after the pruned vocab.
+        native_tokens: List of new NON-special BPE token strings (merged CJK chars).
+        native_merges: List of [a_str, b_str] merges appended to rebuild native_tokens.
     """
     if extra_special_tokens is None:
         extra_special_tokens = []
+    if native_tokens is None:
+        native_tokens = []
+    if native_merges is None:
+        native_merges = []
 
     byte_encoder = _get_byte_encoder()
     
@@ -272,33 +307,43 @@ def save_vocab_huggingface(bytes_list, token_mapping, output_path, old_tokenizer
     print(f"New HuggingFace vocab.json (size: {len(new_vocab)}) saved to {vocab_path}")
     
     # Update tokenizer.json with the new vocabulary (this is the key fix!)
-    # Returns the actual vocab size and special token IDs for consistency
+    # Returns the actual vocab size and special-token IDs for consistency
     actual_vocab_size, special_token_ids = _update_tokenizer_json(
         output_path, new_vocab, token_mapping, old_tokenizer,
-        extra_special_tokens=extra_special_tokens
+        extra_special_tokens=extra_special_tokens,
+        native_tokens=native_tokens, native_merges=native_merges
     )
-    
+
     # Update tokenizer config to only have BOS and EOS, remove other special tokens
     if only_bos_eos:
         _update_tokenizer_config_minimal(output_path, old_tokenizer, new_vocab,
                                          actual_vocab_size, special_token_ids,
-                                         extra_special_tokens=extra_special_tokens)
+                                         extra_special_tokens=extra_special_tokens,
+                                         native_merges=native_merges)
 
 
 def _update_tokenizer_json(output_path, new_vocab, token_mapping, old_tokenizer,
-                           extra_special_tokens=None):
+                           extra_special_tokens=None, native_tokens=None, native_merges=None):
     """
     Update tokenizer.json with the new pruned vocabulary.
     This is essential for modern HuggingFace tokenizers (Qwen2, etc.)
-    
+
     Args:
-        extra_special_tokens: List of new special token strings to add.
-    
+        extra_special_tokens: List of new special token strings to add (as added tokens).
+        native_tokens: List of new NON-special BPE token strings (merged CJK chars +
+            intermediates), added to model.vocab after the special-token id range.
+        native_merges: List of [a_str, b_str] merges appended (lowest priority) so the
+            byte-level BPE rebuilds each native token.
+
     Returns:
         tuple: (actual_vocab_size, special_token_ids dict)
     """
     if extra_special_tokens is None:
         extra_special_tokens = []
+    if native_tokens is None:
+        native_tokens = []
+    if native_merges is None:
+        native_merges = []
 
     tokenizer_json_path = os.path.join(output_path, 'tokenizer.json')
     if not os.path.exists(tokenizer_json_path):
@@ -399,38 +444,54 @@ def _update_tokenizer_json(output_path, new_vocab, token_mapping, old_tokenizer,
         })
 
     tokenizer_data['added_tokens'] = new_added_tokens
-    if extra_special_tokens:
-        print(f"Updated added_tokens: {len(new_added_tokens)} total "
-              f"(including {len(extra_special_tokens)} extra special tokens)")
-    else:
-        print(f"Updated added_tokens: kept {len(new_added_tokens)} essential special tokens")
-    
+
+    # Append NATIVE merged-char tokens to the BPE vocab (real entries, not added
+    # tokens), with ids after the special-token range, plus their merge rules at
+    # lowest priority so the byte-level BPE rebuilds each one.
+    native_base_id = extra_base_id + len(extra_special_tokens)
+    for i, token_str in enumerate(native_tokens):
+        pruned_vocab[token_str] = native_base_id + i
+    tokenizer_data['model']['vocab'] = pruned_vocab
+
+    if native_merges:
+        merges_list = tokenizer_data['model'].get('merges', [])
+        as_list = bool(merges_list) and isinstance(merges_list[0], list)
+        for a, b in native_merges:
+            merges_list.append([a, b] if as_list else f"{a} {b}")
+        tokenizer_data['model']['merges'] = merges_list
+
+    print(f"Updated added_tokens: {len(new_added_tokens)} ({len(extra_special_tokens)} extra special)")
+    print(f"Appended {len(native_tokens)} native merged-char tokens + {len(native_merges)} merges")
+
     # Save updated tokenizer.json
     with open(tokenizer_json_path, 'w', encoding='utf-8') as f:
         json.dump(tokenizer_data, f, ensure_ascii=False, indent=2)
-    
+
     total_vocab_size = len(pruned_vocab) + len(special_token_new_ids)
-    print(f"Updated tokenizer.json: vocabulary size {len(old_vocab)} -> {len(pruned_vocab)} BPE "
+    print(f"Updated tokenizer.json: vocabulary size {len(old_vocab)} -> "
+          f"{len(pruned_vocab)} BPE (incl. {len(native_tokens)} native merged-char) "
           f"+ {len(special_token_new_ids)} special = {total_vocab_size} total")
-    
+
     return total_vocab_size, special_token_new_ids
 
 
-def _update_merges_txt(output_path, valid_tokens):
-    """Update merges.txt to only include valid tokens."""
+def _update_merges_txt(output_path, valid_tokens, native_merges=None):
+    """Update merges.txt: keep valid pruned merges, then append native merges."""
+    if native_merges is None:
+        native_merges = []
     merges_path = os.path.join(output_path, 'merges.txt')
     if not os.path.exists(merges_path):
         return
-    
+
     with open(merges_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
-    
+
     # First line is usually a header like "#version: 0.2"
     new_lines = []
     if lines and lines[0].startswith('#'):
         new_lines.append(lines[0])
         lines = lines[1:]
-    
+
     for line in lines:
         line = line.rstrip('\n')
         if not line:
@@ -440,29 +501,37 @@ def _update_merges_txt(output_path, valid_tokens):
             merged = parts[0] + parts[1]
             if parts[0] in valid_tokens and parts[1] in valid_tokens and merged in valid_tokens:
                 new_lines.append(line + '\n')
-    
+
+    kept = len(new_lines) - (1 if new_lines and new_lines[0].startswith('#') else 0)
+    # Append native merges (lowest priority) so the slow tokenizer matches tokenizer.json
+    for a, b in native_merges:
+        new_lines.append(f"{a} {b}\n")
+
     with open(merges_path, 'w', encoding='utf-8') as f:
         f.writelines(new_lines)
-    
-    print(f"Updated merges.txt: {len(lines)} -> {len(new_lines) - 1} merges")
+
+    print(f"Updated merges.txt: kept {kept} + {len(native_merges)} native merges")
 
 
 def _update_tokenizer_config_minimal(output_path, old_tokenizer, new_vocab,
                                      actual_vocab_size=None, special_token_ids=None,
-                                     extra_special_tokens=None):
+                                     extra_special_tokens=None, native_merges=None):
     """Update tokenizer config to only use BOS/EOS tokens plus any extra special tokens.
-    
+
     Args:
         special_token_ids: Dict mapping token content -> new token ID (from _update_tokenizer_json)
         extra_special_tokens: List of new special token strings that were added.
+        native_merges: List of [a_str, b_str] native merges to also append to merges.txt.
     """
     if special_token_ids is None:
         special_token_ids = {}
     if extra_special_tokens is None:
         extra_special_tokens = []
-    
-    # Also update merges.txt
-    _update_merges_txt(output_path, set(new_vocab.keys()))
+    if native_merges is None:
+        native_merges = []
+
+    # Also update merges.txt (keep valid pruned merges, then append native merges)
+    _update_merges_txt(output_path, set(new_vocab.keys()), native_merges=native_merges)
     
     # Update tokenizer_config.json
     tokenizer_config_path = os.path.join(output_path, 'tokenizer_config.json')
@@ -498,7 +567,8 @@ def _update_tokenizer_config_minimal(output_path, old_tokenizer, new_vocab,
         if extra_special_tokens:
             config['additional_special_tokens'] = list(extra_special_tokens)
 
-        # Build added_tokens_decoder for all special tokens (HF expects this)
+        # Build added_tokens_decoder for all added tokens (HF expects this):
+        # special tokens (BOS/EOS/lang ids) and non-special merged-char tokens.
         added_tokens_decoder = {}
         for tok_content, tok_id in special_token_ids.items():
             added_tokens_decoder[str(tok_id)] = {
@@ -535,13 +605,11 @@ def _update_tokenizer_config_minimal(output_path, old_tokenizer, new_vocab,
             json.dump(minimal_map, f, ensure_ascii=False, indent=2)
         print(f"Updated special_tokens_map.json")
     
-    # Update added_tokens.json with all special tokens (BOS/EOS + extras)
+    # Update added_tokens.json with the special tokens (BOS/EOS + lang ids).
+    # Native merged-char tokens are real BPE entries, not added tokens.
     added_tokens_path = os.path.join(output_path, 'added_tokens.json')
     if os.path.exists(added_tokens_path):
-        added_map = {}
-        for tok_content, tok_id in special_token_ids.items():
-            added_map[tok_content] = tok_id
-        
+        added_map = {tok: tid for tok, tid in special_token_ids.items()}
         with open(added_tokens_path, 'w', encoding='utf-8') as f:
             json.dump(added_map, f, ensure_ascii=False, indent=2)
         print(f"Updated added_tokens.json: {len(added_map)} tokens")
