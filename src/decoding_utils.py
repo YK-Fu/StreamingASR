@@ -38,6 +38,7 @@ class WER(NeMoWER):
                 encoder_output=predictions,
                 encoded_lengths=predictions_lengths,
                 fold_consecutive=self.fold_consecutive,
+                input_ids=input_ids,
             )
         elif isinstance(self.decoding, AbstractCTCDecoding):
             self.decode = lambda predictions, predictions_lengths, predictions_mask, input_ids: self.decoding.ctc_decoder_predictions_tensor(
@@ -106,8 +107,16 @@ class RNNTInfer:
             position_ids = torch.zeros(batch_size, self.max_length, device=device, dtype=torch.long)
         else:
             assert batch_size is None or batch_size == input_ids.size(0), "batch_size and input_ids.size(0) must be the same or batch_size is None"
-            assert attn_mask is not None and position_ids is not None, "attn_mask and position_ids must be provided if input_ids is provided"
             input_ids = input_ids.to(device)
+            # The prompt passed by the WER path ([bos, <language>, ...]) is
+            # unpadded, so all tokens are valid and positions are contiguous.
+            # Build the mask / positions here when the caller omits them.
+            if attn_mask is None:
+                attn_mask = torch.ones_like(input_ids, dtype=torch.int32)
+            if position_ids is None:
+                position_ids = torch.arange(input_ids.size(1), device=device, dtype=torch.long).unsqueeze(0).expand(input_ids.size(0), -1).contiguous()
+            attn_mask = attn_mask.to(device)
+            position_ids = position_ids.to(device)
             if input_ids.size(1) != self.max_length:
                 assert input_ids.size(1) < self.max_length, "input_ids.size(1) must be less than max_length - 1"
                 input_ids = F.pad(input_ids, (0, self.max_length - input_ids.size(1)), value=self.bos_idx)
@@ -131,9 +140,22 @@ class RNNTInfer:
             cache=cache,
             cache_position=cache_position
         )
-        next_token_logits = outputs.transpose(1, 2)[torch.arange(batch_size), valid_lengths].unsqueeze(1)
+        # The state that predicts the first generated token is the LAST CONSUMED
+        # token's hidden state, i.e. index valid_lengths - 1 (not valid_lengths,
+        # which is the first padding slot).
+        next_token_logits = outputs.transpose(1, 2)[torch.arange(batch_size), valid_lengths - 1].unsqueeze(1)
         next_attn_mask = F.pad(attn_mask, (0, 1), value=1)      # (b, max_length) -> (b, max_length + 1)
-        next_position_ids = position_ids[torch.arange(batch_size), valid_lengths].unsqueeze(-1) + 1
+        # position_ids / cache_position follow the SAME "last consumed token"
+        # convention: both index valid_lengths - 1. The decode loop increments
+        # them by 1 (in the emit block) before the next forward, so the first
+        # generated token lands at the contiguous next position/slot. Using
+        # `position_ids[..., valid_lengths] + 1` here double-counted and left a
+        # phantom one-token gap after the prompt (positions 0,2,3,... vs the
+        # 0,1,2,3,... the decoder sees during training).
+        next_position_ids = position_ids[torch.arange(batch_size), valid_lengths - 1].unsqueeze(-1)
+        # NOTE: cache_position is a single shared scalar for the whole batch, so
+        # variable-length prompts in one batch are only correct when all
+        # valid_lengths are equal (the default BOS-only start satisfies this).
         next_cache_position = valid_lengths.max().unsqueeze(0) - 1
 
         # The content of input_ids will not be used again, we return it as the placeholder for the one step decode stage
@@ -205,12 +227,15 @@ class LoopLabelRNNTInfer(RNNTInfer):
                 for b in range(batch_size):
                     if predictions[b] != self.blank_idx:
                         input_ids[b, 0] = predictions[b]
-                        attn_mask[b, cache_position] = 1
+                        # Mark the slot this token will occupy on the NEXT forward
+                        # (cache_position+1), not the last-consumed slot, so the
+                        # token attends to itself (matching training's causal mask).
+                        attn_mask[b, cache_position + 1] = 1
                         position_ids[b, 0] = position_ids[b, 0] + 1
                         symbols_added[b] += 1
                         hyps[b].y_sequence.append(predictions[b].item())
                     else:
-                        attn_mask[b, cache_position] = 0
+                        attn_mask[b, cache_position + 1] = 0
                 dec_out = None
                 cache_position = cache_position + 1
         return hyps, input_ids, attn_mask, position_ids, cache, cache_position
@@ -399,9 +424,12 @@ class RNNTDecoding(ConfidenceMethodMixin):
     def compute_rnnt_timestamps(self, hypothesis: rnnt_utils.Hypothesis, timestamp_type: str = 'all'):
         # TODO
         pass
-    def rnnt_decoder_predictions_tensor(self, encoder_output, encoded_lengths, return_hypotheses: bool = False, partial_hypotheses: Optional[List[rnnt_utils.Hypothesis]] = None, **kwargs):
+    def rnnt_decoder_predictions_tensor(self, encoder_output, encoded_lengths, return_hypotheses: bool = False, partial_hypotheses: Optional[List[rnnt_utils.Hypothesis]] = None, input_ids=None, **kwargs):
         with torch.inference_mode():
-            hypotheses_list = self.decoding.decode(encoder_output=encoder_output)  # type: [List[Hypothesis]]
+            # input_ids is the prompt prefix ([bos, <language>, ...]) that the
+            # predictor/joint were trained on; seeding it is required, otherwise
+            # the bos-only initial state is out-of-distribution for the joint.
+            hypotheses_list = self.decoding.decode(encoder_output=encoder_output, input_ids=input_ids)  # type: [List[Hypothesis]]
 
             # extract the hypotheses
             hypotheses_list = hypotheses_list[0]  # type: List[Hypothesis]

@@ -324,11 +324,21 @@ class PrunedRNNTJoint(RNNTJoint):
                     original_sync = self.wer._to_sync
                     self.wer._to_sync = False
 
+                # Seed the greedy RNN-T decoder with the same prompt prefix the
+                # model was trained on: context[:, :target_start] = [bos, <language>, ...].
+                # Training never scores the bos-only predictor state (boundary
+                # s_begin = target_start - 1 >= 1), so decoding from bos alone is
+                # out-of-distribution for the joint and emits only blanks. Slice to
+                # the COMMON prefix (min target_start) so no transcription token is
+                # ever leaked for variable-length prompts.
+                prompt_len = int(target_start.min().item())
+                prompt_ids = transcripts[:, :prompt_len] if prompt_len > 0 else None
                 self.wer.update(
                     predictions=encoder_outputs,
                     predictions_lengths=encoder_lengths,
                     targets=targets,
                     targets_lengths=target_end - target_start,
+                    input_ids=prompt_ids,
                 )
                 # Sync and all_reduce on all processes, compute global WER
                 wer, wer_num, wer_denom = self.wer.compute()

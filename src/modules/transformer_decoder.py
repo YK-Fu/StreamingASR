@@ -35,9 +35,14 @@ class LLMDecoder(nn.Module):
             input_ids=input_ids, 
             position_ids=position_ids,
             attention_mask=attn_mask, 
-            past_key_values=cache, 
+            past_key_values=cache,
             cache_position=cache_position,
-            use_cache=not self.training
+            # Use the KV cache iff one was passed. Incremental greedy decode passes
+            # a StaticCache and MUST cache regardless of train/eval mode (the old
+            # `not self.training` disabled caching during training-time WER, so the
+            # predictor lost history after the first step). Teacher-forcing passes
+            # cache=None -> no caching, as intended.
+            use_cache=cache is not None
         )
         g, states = output.last_hidden_state, output.past_key_values  # (B, U, D)
         g = g.transpose(1, 2)  # (B, D, U)
