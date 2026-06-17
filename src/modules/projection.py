@@ -59,7 +59,7 @@ class ProjHead(NeuralModule, Exportable):
     """
 
     def __init__(self, feat_in, num_classes, hidden_dims=None, activation='silu',
-                 init_mode='xavier_uniform', vocabulary=None, tie_weights=False):
+                 init_mode='xavier_uniform', vocabulary=None, tie_weights=False, init_scale=0.25):
         super().__init__()
         self.__vocabulary = vocabulary
         self._feat_in = feat_in
@@ -81,6 +81,8 @@ class ProjHead(NeuralModule, Exportable):
             self.decoder_layers = torch.nn.Linear(prev, num_classes, bias=False)
 
         self.apply(lambda x: init_weights(x, mode=init_mode))
+        if not self.tie_weights and init_scale != 1.0:
+            self.decoder_layers.weight.data.mul_(init_scale)
         # to change, requires running ``model.temperature = T`` explicitly
         self.temperature = 1.0
 

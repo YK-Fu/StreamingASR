@@ -1,7 +1,7 @@
 
 import torch
 import torch.nn as nn
-from transformers import AutoModel
+from transformers import AutoModelForCausalLM
 from nemo.utils import logging
 
 dtype_map = {
@@ -15,7 +15,7 @@ class LLMDecoder(nn.Module):
         super().__init__()
         config.torch_dtype = dtype_map[dtype]
         self.config = config
-        self.prediction = AutoModel.from_config(self.config)
+        self.prediction = AutoModelForCausalLM.from_config(self.config)
         # Enable gradient checkpointing if specified in config
         if gradient_checkpointing:
             logging.info("Enabling gradient checkpointing for decoder")
@@ -30,21 +30,20 @@ class LLMDecoder(nn.Module):
                 if '.mlp.' in name:
                     param.requires_grad = False
 
-    def forward(self, input_ids, position_ids=None, attn_mask=None, cache=None, cache_position=None):
-        output = self.prediction(
-            input_ids=input_ids, 
+    def forward(self, input_ids, position_ids=None, attn_mask=None, cache=None, cache_position=None, return_lm_logits=False):
+        output = self.prediction.model(
+            input_ids=input_ids,
             position_ids=position_ids,
-            attention_mask=attn_mask, 
+            attention_mask=attn_mask,
             past_key_values=cache,
             cache_position=cache_position,
-            # Use the KV cache iff one was passed. Incremental greedy decode passes
-            # a StaticCache and MUST cache regardless of train/eval mode (the old
-            # `not self.training` disabled caching during training-time WER, so the
-            # predictor lost history after the first step). Teacher-forcing passes
-            # cache=None -> no caching, as intended.
             use_cache=cache is not None
         )
-        g, states = output.last_hidden_state, output.past_key_values  # (B, U, D)
-        g = g.transpose(1, 2)  # (B, D, U)
 
+        h = output.last_hidden_state          # (B, U, D)
+        states = output.past_key_values
+        g = h.transpose(1, 2)                 # (B, D, U)
+        if return_lm_logits:
+            lm_logits = self.prediction.lm_head(h)   # (B, U, V)
+            return g, lm_logits, states
         return g, states

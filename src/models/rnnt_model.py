@@ -60,11 +60,14 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         num_vocab = self.tokenizer.vocab_size
         self.blank_id = self.tokenizer.token_to_id(self.cfg.tokenizer.blank_token)
+        # Fill the -1 num_classes placeholders for the dedicated simple projections.
+        for proj_name in ('simple_am_proj', 'simple_lm_proj'):
+            if proj_name in self.cfg and self.cfg[proj_name].get('num_classes', -1) < 1:
+                self.cfg[proj_name].num_classes = num_vocab
         with open_dict(self.cfg.decoder.config):
             self.cfg.decoder.config.vocab_size = num_vocab
             self.cfg.decoder.config.bos_token_id = self.tokenizer.tokenizer.bos_token_id
             self.cfg.decoder.config.eos_token_id = self.tokenizer.tokenizer.eos_token_id
-            self.cfg.decoder.projection.num_classes = num_vocab
 
 
         with open_dict(self.cfg.joint):
@@ -92,10 +95,14 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         else:
             self.llm_loss = None
             self.llm_loss_weight = 0
-        # We use LLM prediction head and ctc_decoder_head as simple_lm_proj and simple_am_proj to save parameters
-        self.llm_head = HybridRNNTCTCWhisperLMModel.from_config_dict(self.cfg.decoder.projection)
-        if self.llm_head.tie_weights:
-            self.llm_head_weights = self.decoder.prediction.embed_tokens.weight
+        # The auxiliary LLM (NLL) loss now uses the decoder's NATIVE Qwen lm_head
+        # (LLMDecoder wraps AutoModelForCausalLM); the lm_head<->embedding tie is set by
+        # decoder.config.tie_word_embeddings. No separate llm_head module here.
+        # Dedicated simple_lm_proj for the pruned RNN-T smoothed loss, UNTIED from the
+        # LM head (config: model.simple_lm_proj). The LM head wants a next-token
+        # distribution; the smoothed loss wants an acoustic-alignment score for
+        # prune-range estimation.
+        self.simple_lm_proj = HybridRNNTCTCWhisperLMModel.from_config_dict(self.cfg.simple_lm_proj)
         self.joint = HybridRNNTCTCWhisperLMModel.from_config_dict(self.cfg.joint)
 
         if hasattr(self.cfg, 'spec_augment') and self.cfg.spec_augment is not None:
@@ -143,7 +150,13 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             self.cfg.aux_ctc.decoder["num_classes"] = num_vocab
 
         # Setup CTC decoding
-        self.ctc_decoder = HybridRNNTCTCWhisperLMModel.from_config_dict(self.cfg.aux_ctc.decoder)     # This is also used as simple_am_proj
+        self.ctc_decoder = HybridRNNTCTCWhisperLMModel.from_config_dict(self.cfg.aux_ctc.decoder)
+        # Dedicated simple_am_proj for the pruned RNN-T smoothed loss, UNTIED from the
+        # CTC head (config: model.simple_am_proj; icefall keeps these separate). Sharing
+        # one projection forced it to serve both CTC (spiky, blank-dominated) and the k2
+        # smoothed loss (a smooth acoustic score for prune-range estimation), which are
+        # conflicting objectives.
+        self.simple_am_proj = HybridRNNTCTCWhisperLMModel.from_config_dict(self.cfg.simple_am_proj)
         self.ctc_loss_weight = self.cfg.aux_ctc.get("ctc_loss_weight", 0.5)
         self.ctc_loss = CTCLoss(
                     num_classes=self.ctc_decoder.num_classes_with_blank - 1,
@@ -306,23 +319,21 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         encoded = self.forward(input_signal=signal, language_ids=language_ids)
         encoded_len = torch.full((encoded.shape[0],), encoded.shape[2], device=encoded.device)
 
+        # simple_am for the smoothed RNN-T loss now comes from its own projection.
+        simple_am = self.simple_am_proj(encoded, return_logits=True, return_softmax=False)
         if self.ctc_loss_weight > 0:
-            simple_am, ctc_output = self.ctc_decoder(encoded, return_logits=True, return_softmax=True)
-        else:
-            simple_am = self.ctc_decoder(encoded, return_logits=True, return_softmax=False)
+            ctc_output = self.ctc_decoder(encoded, return_logits=False, return_softmax=True)
 
         # do not include the last token in the context for the decoder (this model does not predict eos token)
-        decoded, _ = self.decoder(input_ids=context, attn_mask=attn_mask)
-        if self.llm_head.tie_weights:
-            if self.llm_loss is not None:
-                simple_lm, lm_output = self.llm_head(decoded, return_logits=True, return_softmax=True, weights=self.llm_head_weights)
-            else:
-                simple_lm = self.llm_head(decoded, return_logits=True, return_softmax=False, weights=self.llm_head_weights)
+        # Decoder forward. When the aux LLM loss is on, also fetch the native Qwen
+        # lm_head logits (one fused forward); otherwise skip the lm_head entirely.
+        if self.llm_loss is not None:
+            decoded, lm_logits, _ = self.decoder(input_ids=context, attn_mask=attn_mask, return_lm_logits=True)
+            lm_output = torch.log_softmax(lm_logits, dim=-1)   # log-probs for NLLLoss
         else:
-            if self.llm_loss is not None:
-                simple_lm, lm_output = self.llm_head(decoded, return_logits=True, return_softmax=True)
-            else:
-                simple_lm = self.llm_head(decoded, return_logits=True, return_softmax=False)
+            decoded, _ = self.decoder(input_ids=context, attn_mask=attn_mask)
+        # simple_lm (for the k2 smoothed loss) from its own dedicated projection.
+        simple_lm = self.simple_lm_proj(decoded, return_logits=True, return_softmax=False)
 
         if hasattr(self, '_trainer') and self._trainer is not None:
             log_every_n_steps = self._trainer.log_every_n_steps
@@ -344,7 +355,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             llm_loss = 0
 
         # Icefall-style discrete warmup: keep pruned_loss off entirely until the
-        # smoothed-loss path has trained simple_am_proj (= ctc_decoder) enough that
+        # smoothed-loss path has trained simple_am_proj enough that
         # k2.get_rnnt_prune_ranges covers the true alignment. Phase 1 (warmup<1):
         # simple only. Phase 2 (1<=warmup<2): 10% pruned. Phase 3: full pruned,
         # reduced simple.
@@ -456,12 +467,10 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         tensorboard_logs = {}
 
         if self.compute_eval_loss:
-            simple_am, ctc_output = self.ctc_decoder(encoded, return_logits=True, return_softmax=True)
+            simple_am = self.simple_am_proj(encoded, return_logits=True, return_softmax=False)
+            ctc_output = self.ctc_decoder(encoded, return_logits=False, return_softmax=True)
             decoded, _ = self.decoder(input_ids=context[..., :-1], attn_mask=attn_mask)
-            if self.llm_head.tie_weights:
-                simple_lm = self.llm_head(decoded, return_logits=True, return_softmax=False, weights=self.llm_head_weights)
-            else:
-                simple_lm = self.llm_head(decoded, return_logits=True, return_softmax=False)
+            simple_lm = self.simple_lm_proj(decoded, return_logits=True, return_softmax=False)
             ctc_loss = self.ctc_loss(
                 log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_end - target_start
             )
