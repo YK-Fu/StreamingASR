@@ -172,65 +172,46 @@ def convert_whisper_encoder_weights(
 def convert_qwen_decoder_weights(
     hf_model_path: str,
     vocab_size: int,
-    tie_weights: bool = True,
 ) -> Dict[str, torch.Tensor]:
     """
-    Convert HuggingFace Qwen to LLMDecoder state_dict (no prefix).
-    
-    Since LLMDecoder uses AutoModel.from_config(Qwen2Config), the HF Qwen2 weights 
-    map with just the "model." prefix removed.
-    
+    Convert HuggingFace Qwen to LLMDecoder.prediction state_dict.
+
+    LLMDecoder now wraps AutoModelForCausalLM (Qwen2ForCausalLM), so the HF state_dict
+    maps 1:1 — keep the "model." prefix and the native "lm_head.weight". The embedding
+    and lm_head rows are trimmed to vocab_size. The lm_head<->embedding tie is handled
+    by the model itself via config.tie_word_embeddings (for tied models lm_head.weight
+    may be absent from the state_dict; strict=False at load time handles that).
+
     Architecture mapping:
-        HF Qwen                      -> LLMDecoder.prediction
+        HF Qwen2ForCausalLM          -> LLMDecoder.prediction (Qwen2ForCausalLM)
         ----------------------------------------------------------------
-        model.embed_tokens.weight    -> embed_tokens.weight
-        model.layers[i].*            -> layers[i].*
-        model.norm.weight            -> norm.weight
-    
+        model.embed_tokens.weight    -> model.embed_tokens.weight (trimmed)
+        model.layers[i].*            -> model.layers[i].*
+        model.norm.weight            -> model.norm.weight
+        lm_head.weight               -> lm_head.weight (trimmed; absent if tied)
+
     Args:
         hf_model_path: Path or HuggingFace model name (e.g., "Qwen/Qwen2.5-0.5B")
-        vocab_size: Vocabulary size (For some reasons, the HF Qwen model has more tokens than the vocabulary size)
-        tie_weights: Whether to tie word embeddings with projection head
-    
+        vocab_size: Vocabulary size (the HF Qwen vocab is usually larger; rows are trimmed)
+
     Returns:
-        Tuple of (decoder_state_dict, llm_head_weight or None)
+        decoder_state_dict for model.decoder.prediction
     """
     from transformers import AutoModelForCausalLM
-    
+
     print(f"Loading Qwen model from {hf_model_path}...")
     hf_model = AutoModelForCausalLM.from_pretrained(hf_model_path, trust_remote_code=True)
     hf_state = hf_model.state_dict()
-    
+
     converted = OrderedDict()
-    lm_head_weight = None
-    
-    # Map model.* weights (remove "model." prefix)
     for key, value in hf_state.items():
-        if key.startswith("model."):
-            # Remove "model." prefix
-            if 'embed_tokens' in key:
-                value = value[:vocab_size]
-            new_key = key[6:]  # key[6:] removes "model."
-            converted[new_key] = value
-    
-    # Handle LM head / word embedding tying
-    if not tie_weights:
-        # Need separate projection weights
-        if "lm_head.weight" in hf_state:
-            lm_head_weight = hf_state["lm_head.weight"][:vocab_size]
-            print("Using lm_head.weight for untied projection head")
-        else:
-            # Copy from embed_tokens
-            if "embed_tokens.weight" in converted:
-                lm_head_weight = converted["embed_tokens.weight"].clone()
-                print("Copying embed_tokens.weight for untied projection head")
-            else:
-                print("WARNING: Could not find embedding weights for untied projection head")
-    else:
-        print("Using tied weights - projection head will share embed_tokens.weight")
-    
+        # Trim the vocab dimension of the embedding and the (untied) lm_head.
+        if 'embed_tokens' in key or key == 'lm_head.weight':
+            value = value[:vocab_size]
+        converted[key] = value
+
     print(f"Qwen decoder conversion complete. Total keys: {len(converted)}")
-    return converted, lm_head_weight
+    return converted
 
 
 def create_rnnt_model_checkpoint(whisper_path, qwen_path, model):
@@ -252,38 +233,31 @@ def create_rnnt_model_checkpoint(whisper_path, qwen_path, model):
         print(f"  Encoder unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Encoder unexpected keys: {unexpected}")
     print(f"  Encoder weights loaded successfully")
     
-    # Convert and load decoder weights
-    print(f"\n=== Converting Qwen decoder ===")
-    decoder_state, lm_head_weight = convert_qwen_decoder_weights(
+    # Convert and load decoder weights (incl. native lm_head) into decoder.prediction
+    # (Qwen2ForCausalLM). The lm_head<->embedding tie is handled by the model via
+    # config.tie_word_embeddings.
+    print(f"\n=== Converting Qwen decoder (ForCausalLM) ===")
+    decoder_state = convert_qwen_decoder_weights(
         qwen_path,
         vocab_size=model.tokenizer.vocab_size,
-        tie_weights=model.cfg.decoder.projection.get("tie_weights", False),
     )
-    
-    # Load decoder weights (into decoder.prediction)
+
     missing, unexpected = model.decoder.prediction.load_state_dict(decoder_state, strict=False)
+    # `lm_head.weight` legitimately appears as a missing key when the model ties it to
+    # the embedding (tie_word_embeddings=True) — it shares embed_tokens.weight.
     if missing:
         print(f"  Decoder missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Decoder missing keys: {missing}")
     if unexpected:
         print(f"  Decoder unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Decoder unexpected keys: {unexpected}")
-    print(f"  Decoder weights loaded successfully")
-    
-    # Load LLM head weights if not tied. Only valid when ProjHead has hidden_dims=[]
-    # (single Linear); a multi-layer LLM head can't accept a single Qwen lm_head
-    # matrix directly because the input dim differs (the head consumes the last hidden,
-    # not the raw decoder output).
-    if lm_head_weight is not None and hasattr(model, 'llm_head') and hasattr(model.llm_head, 'decoder_layers'):
-        dst_shape = tuple(model.llm_head.decoder_layers.weight.shape)
-        src_shape = tuple(lm_head_weight.shape)
-        if dst_shape == src_shape:
-            model.llm_head.decoder_layers.weight.data.copy_(lm_head_weight)
-            print(f"  LLM head weights loaded (untied)")
-        else:
-            print(
-                f"  WARNING: LLM head shape mismatch (src {src_shape} vs dst {dst_shape}); "
-                f"skipping copy. If llm_head has hidden_dims set, that's expected — the "
-                f"head's pre-layers will stay at random init."
-            )
+    print(f"  Decoder + native lm_head weights loaded successfully")
+
+    # --- Dedicated pruned-RNN-T simple projections: kept at RANDOM init ---
+    # simple_am_proj / simple_lm_proj (icefall-style, untied from the CTC and LM heads)
+    # are already randomly initialized by the model __init__ using the configured
+    # simple_proj.init_scale. They are NOT loaded from Qwen.
+    for name in ("simple_am_proj", "simple_lm_proj"):
+        if getattr(model, name, None) is not None:
+            print(f"  {name}: kept at __init__ random init (config simple_proj.init_scale); NOT loaded from Qwen")
 
 
 def create_distill_model_checkpoint(whisper_path, model):
@@ -391,8 +365,8 @@ def main():
             qwen_path=args.qwen,
             model=model
         )
-        encoder_total_params = sum(p.numel() for p in model.encoder.parameters()) + sum(p.numel() for p in model.ctc_decoder.parameters())
-        decoder_total_params = sum(p.numel() for p in model.decoder.parameters()) + sum(p.numel() for p in model.llm_head.parameters())
+        encoder_total_params = sum(p.numel() for p in model.encoder.parameters()) + sum(p.numel() for p in model.ctc_decoder.parameters()) + sum(p.numel() for p in model.simple_am_proj.parameters())
+        decoder_total_params = sum(p.numel() for p in model.decoder.parameters()) + sum(p.numel() for p in model.simple_lm_proj.parameters())
         joiner_total_params = sum(p.numel() for p in model.joint.parameters())
         print(f"\n=== Summary ===")
         print(f"  Encoder total parameters: {encoder_total_params:,}")

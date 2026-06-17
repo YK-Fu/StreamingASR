@@ -59,7 +59,7 @@ class ProjHead(NeuralModule, Exportable):
     """
 
     def __init__(self, feat_in, num_classes, hidden_dims=None, activation='silu',
-                 init_mode='xavier_uniform', vocabulary=None, tie_weights=False):
+                 init_mode='xavier_uniform', vocabulary=None, tie_weights=False, init_scale=0.25):
         super().__init__()
         self.__vocabulary = vocabulary
         self._feat_in = feat_in
@@ -81,6 +81,8 @@ class ProjHead(NeuralModule, Exportable):
             self.decoder_layers = torch.nn.Linear(prev, num_classes, bias=False)
 
         self.apply(lambda x: init_weights(x, mode=init_mode))
+        if not self.tie_weights and init_scale != 1.0:
+            self.decoder_layers.weight.data.mul_(init_scale)
         # to change, requires running ``model.temperature = T`` explicitly
         self.temperature = 1.0
 
@@ -324,11 +326,21 @@ class PrunedRNNTJoint(RNNTJoint):
                     original_sync = self.wer._to_sync
                     self.wer._to_sync = False
 
+                # Seed the greedy RNN-T decoder with the same prompt prefix the
+                # model was trained on: context[:, :target_start] = [bos, <language>, ...].
+                # Training never scores the bos-only predictor state (boundary
+                # s_begin = target_start - 1 >= 1), so decoding from bos alone is
+                # out-of-distribution for the joint and emits only blanks. Slice to
+                # the COMMON prefix (min target_start) so no transcription token is
+                # ever leaked for variable-length prompts.
+                prompt_len = int(target_start.min().item())
+                prompt_ids = transcripts[:, :prompt_len] if prompt_len > 0 else None
                 self.wer.update(
                     predictions=encoder_outputs,
                     predictions_lengths=encoder_lengths,
                     targets=targets,
                     targets_lengths=target_end - target_start,
+                    input_ids=prompt_ids,
                 )
                 # Sync and all_reduce on all processes, compute global WER
                 wer, wer_num, wer_denom = self.wer.compute()
