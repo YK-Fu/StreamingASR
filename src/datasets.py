@@ -3,11 +3,184 @@ import math
 import os
 import random
 import torch
+import torch.nn.functional as F
 import torchaudio
+import torchaudio.functional as AF
 from typing import List, Optional, Union, Literal
 from torch.utils.data import Dataset, DistributedSampler, DataLoader
 import numpy as np
 from nemo.utils import logging
+
+
+def _rand_uniform(low: float, high: float) -> float:
+    """Uniform sample in [low, high] using torch RNG (seeded per dataloader worker)."""
+    if high <= low:
+        return low
+    return low + (high - low) * torch.rand(1).item()
+
+
+def _rand_int(low: int, high: int) -> int:
+    """Inclusive random integer in [low, high] using torch RNG."""
+    if high <= low:
+        return low
+    return int(torch.randint(low, high + 1, (1,)).item())
+
+
+class AudioAugmentor:
+    """
+    On-the-fly waveform augmentation for training, implemented entirely with
+    torch / torchaudio (no pydub / librosa).
+
+    Applied per-sample inside the dataloader workers on the mono, un-padded
+    waveform. Effects are each gated by their own probability and sample their
+    parameters from a configured range. Order mirrors the reference pipeline:
+        volume -> blur -> echo -> smoothing -> pitch -> additive noise (last)
+
+    Additive noise draws a random file from the `noise_manifests` pool and mixes
+    it at a target SNR (dB) via torchaudio.functional.add_noise, with length matching:
+      * noise longer  than speech: random-crop a speech-length window, mix over all.
+      * noise shorter than speech: random start in the speech, mix only that span.
+    """
+
+    def __init__(self, cfg, sample_rate: int):
+        self.sample_rate = sample_rate
+        self.enabled = bool(cfg.get('enabled', True))
+
+        noise_cfg = cfg.get('noise', {}) or {}
+        self.noise_prob = float(noise_cfg.get('prob', 0.0))
+        self.min_snr_db = float(noise_cfg.get('min_snr_db', 10.0))
+        self.max_snr_db = float(noise_cfg.get('max_snr_db', 20.0))
+        # Noise pool from jsonl manifest(s) with `{"audio_filepath": ...}` lines
+        # (same format as the dataset manifests).
+        self.noise_files = sorted(set(self._read_noise_manifests(noise_cfg.get('noise_manifests', []) or [])))
+
+        self.effects = cfg.get('effects', {}) or {}
+
+        if self.enabled:
+            logging.info(
+                f"AudioAugmentor enabled: {len(self.noise_files)} noise files "
+                f"(prob={self.noise_prob}, snr=[{self.min_snr_db},{self.max_snr_db}] dB); "
+                f"effects={[k for k, v in self.effects.items() if float((v or {}).get('prob', 0.0)) > 0]}"
+            )
+
+    @staticmethod
+    def _read_noise_manifests(manifests) -> List[str]:
+        """Read jsonl manifest(s) listing noise clips via the `audio_filepath` field
+        (same format as the training manifests). Missing files are skipped."""
+        files = []
+        for fp in manifests:
+            if not fp or not os.path.isfile(fp):
+                logging.warning(f"AudioAugmentor: noise manifest not found, skipping: {fp}")
+                continue
+            with open(fp, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    path = json.loads(line).get('audio_filepath')
+                    if path and os.path.exists(path):
+                        files.append(path)
+        return files
+
+    # ---- individual effects (operate on a 1D float waveform) ----
+
+    def _volume(self, wav, c):
+        db = _rand_uniform(float(c.get('min_db', 0.0)), float(c.get('max_db', 0.0)))
+        return wav * (10.0 ** (db / 20.0))
+
+    def _blur(self, wav, c):
+        k = int(c.get('kernel_size', 10))
+        if k <= 1:
+            return wav
+        kernel = torch.ones(1, 1, k, dtype=wav.dtype) / k
+        out = F.conv1d(wav.view(1, 1, -1), kernel, padding=k // 2)
+        return out.view(-1)[:wav.size(0)]
+
+    def _echo(self, wav, c):
+        delay = int(float(c.get('delay_ms', 20)) * self.sample_rate / 1000.0)
+        decay = float(c.get('decay', 0.3))
+        if delay <= 0 or delay >= wav.size(0):
+            return wav
+        out = wav.clone()
+        out[delay:] = out[delay:] + decay * wav[:-delay]
+        return out
+
+    def _smoothing(self, wav, c):
+        seg = int(float(c.get('segment_ms', 10)) * self.sample_rate / 1000.0)
+        if seg <= 0:
+            return wav
+        n_full = wav.size(0) // seg
+        if n_full == 0:
+            return wav
+        out = wav.clone()
+        chunks = out[:n_full * seg].view(n_full, seg)
+        rms = chunks.pow(2).mean(dim=1, keepdim=True).sqrt()
+        # Normalize each chunk to ~unit RMS (full scale); silence guard avoids div-by-0.
+        scale = torch.where(rms > 1e-8, 1.0 / (rms + 1e-8), torch.zeros_like(rms))
+        out[:n_full * seg] = (chunks * scale).view(-1)
+        return out * (10.0 ** (-20.0 / 20.0))  # overall -20 dB, matching reference
+
+    def _pitch(self, wav, c):
+        semitones = _rand_uniform(float(c.get('min_semitones', 0.0)), float(c.get('max_semitones', 0.0)))
+        if abs(semitones) < 1e-3:
+            return wav
+        return AF.pitch_shift(wav.unsqueeze(0), self.sample_rate, n_steps=semitones).squeeze(0)
+
+    def _add_noise(self, wav):
+        if not self.noise_files:
+            return wav
+        path = self.noise_files[_rand_int(0, len(self.noise_files) - 1)]
+        try:
+            noise, sr = torchaudio.load(path)
+        except Exception as e:  # noqa: BLE001 - a single bad noise file must not crash training
+            logging.warning(f"AudioAugmentor: failed to load noise file {path}: {e}")
+            return wav
+        if sr != self.sample_rate:
+            noise = torchaudio.transforms.Resample(sr, self.sample_rate)(noise)
+        if noise.dim() > 1:
+            noise = noise.mean(dim=0)
+        noise = noise.reshape(-1).to(wav.dtype)
+
+        L, n = wav.size(0), noise.size(0)
+        if n == 0 or noise.pow(2).sum() < 1e-8:  # empty / silent noise -> no-op
+            return wav
+        snr = torch.tensor([_rand_uniform(self.min_snr_db, self.max_snr_db)], dtype=wav.dtype)
+
+        if n >= L:
+            # Noise longer: random-crop a speech-length window and mix over the whole clip.
+            start = _rand_int(0, n - L)
+            noise = noise[start:start + L]
+            return AF.add_noise(wav.unsqueeze(0), noise.unsqueeze(0), snr).squeeze(0)
+        else:
+            # Noise shorter: random start in the speech; mix only over that span.
+            s = _rand_int(0, L - n)
+            mixed_seg = AF.add_noise(wav[s:s + n].unsqueeze(0), noise.unsqueeze(0), snr).squeeze(0)
+            out = wav.clone()
+            out[s:s + n] = mixed_seg
+            return out
+
+    def apply(self, wav):
+        if not self.enabled:
+            return wav
+
+        cfg = self.effects
+        if 'volume' in cfg and torch.rand(1).item() < float(cfg['volume'].get('prob', 0.0)):
+            wav = self._volume(wav, cfg['volume'])
+        if 'blur' in cfg and torch.rand(1).item() < float(cfg['blur'].get('prob', 0.0)):
+            wav = self._blur(wav, cfg['blur'])
+        if 'echo' in cfg and torch.rand(1).item() < float(cfg['echo'].get('prob', 0.0)):
+            wav = self._echo(wav, cfg['echo'])
+        if 'smoothing' in cfg and torch.rand(1).item() < float(cfg['smoothing'].get('prob', 0.0)):
+            wav = self._smoothing(wav, cfg['smoothing'])
+        if 'pitch' in cfg and torch.rand(1).item() < float(cfg['pitch'].get('prob', 0.0)):
+            wav = self._pitch(wav, cfg['pitch'])
+        if self.noise_files and torch.rand(1).item() < self.noise_prob:
+            wav = self._add_noise(wav)
+
+        # Anti-clipping: only renormalize if augmentation pushed the signal past full scale.
+        peak = wav.abs().max()
+        if peak > 1.0:
+            wav = wav / peak
+        return wav
 
 
 def pad_list_of_tensors(tensors: List[torch.Tensor], pad_value: float = 0, max_length: Optional[int] = None) -> torch.Tensor:
@@ -73,10 +246,18 @@ class ASRDataset(Dataset):
         audio_chunk_step: Optional[float] = None,
         bucket_by: Literal['audio', 'text', None] = 'audio',
         drop_last: bool = False,
+        augmentation=None,
     ):
         super().__init__()
         self.tokenizer = tokenizer
         self.sample_rate = sample_rate
+        # On-the-fly audio augmentation (training only). Built only when an
+        # `augmentation` block is configured (val/test omit it -> clean audio).
+        self.augmentor = (
+            AudioAugmentor(augmentation, sample_rate)
+            if augmentation is not None and augmentation.get('enabled', True)
+            else None
+        )
         self.language_mapping = language_mapping
         self.language_drop_rate = language_drop_rate
         self.never_drop_language = set(never_drop_language)
@@ -148,6 +329,9 @@ class ASRDataset(Dataset):
         # is slightly shorter than the actual file length after resampling.
         if self.audio_chunk_size is not None and waveform.size(0) > self.audio_chunk_size:
             waveform = waveform[:self.audio_chunk_size]
+        # On-the-fly augmentation (noise / effects); no-op when not configured.
+        if self.augmentor is not None:
+            waveform = self.augmentor.apply(waveform)
         # Drop language with probability language_drop_rate
         language = item.get('language', '<|NO_LANGUAGE_ID|>')
         if torch.rand(1).item() < self.language_drop_rate and language not in self.never_drop_language:
@@ -277,6 +461,7 @@ def get_asr_dataset(
     audio_chunk_step: Optional[float] = None,
     bucket_by: Literal['audio', 'text', None] = 'audio',
     drop_last: bool = False,
+    augmentation=None,
 ) -> Dataset:
     # Handle None case (no manifest configured)
     if manifest_filepath is None:
@@ -308,4 +493,5 @@ def get_asr_dataset(
         audio_chunk_step=audio_chunk_step,
         bucket_by=bucket_by,
         drop_last=drop_last,
+        augmentation=augmentation,
     )

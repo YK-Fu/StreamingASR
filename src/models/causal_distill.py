@@ -151,6 +151,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             language_file=config.get('language_file', ""),
             language_drop_rate=config.get('language_drop_rate', 0.0),
             never_drop_language=config.get('never_drop_language', []),
+            augmentation=config.get('augmentation', None),
         )
         if dataset is None:
             return None

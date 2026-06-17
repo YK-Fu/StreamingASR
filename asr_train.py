@@ -37,7 +37,6 @@ def main(cfg):
     asr_model.maybe_init_from_pretrained_checkpoint(cfg)
 
     if cfg.get("torch_compile", False):
-        import torch._dynamo
         from nemo.core.classes.common import typecheck
         torch._dynamo.config.suppress_errors = True  # fall back to eager on any unhandled break
         # 6 audio shapes (5s-step chunks) × encoder + decoder dynamic graph + ctc/llm/joint
@@ -80,9 +79,6 @@ def main(cfg):
         )
         asr_model.ctc_decoder = torch.compile(
             asr_model.ctc_decoder, dynamic=False, fullgraph=True
-        )
-        asr_model.llm_head = torch.compile(
-            asr_model.llm_head, dynamic=True, fullgraph=False, mode='max-autotune-no-cudagraphs'
         )
         # Compile only joint_after_projection — the surrounding forward_fused_loss
         # contains k2 calls that dynamo can't trace. joint_after_projection captures

@@ -34,7 +34,6 @@ def main(cfg):
     asr_model.maybe_init_from_pretrained_checkpoint(cfg)
 
     if cfg.get("torch_compile", False):
-        import torch._dynamo
         from nemo.core.classes.common import typecheck
         torch._dynamo.config.suppress_errors = True
         # Static distill shapes (audio_chunk_step=30, drop_last=True) → just a handful
