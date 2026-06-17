@@ -27,23 +27,41 @@ echo $NGC_API_KEY | docker login nvcr.io --username '$oauthtoken' --password-std
 
 ### Docker Setup
 
+This project is developed against the **NeMo 26.02** framework container
+(`nvcr.io/nvidia/nemo:26.02`), which ships:
+
+| Component | Version |
+|-----------|---------|
+| PyTorch | `2.10.0a0` (NVIDIA PyTorch 25.11 base) |
+| CUDA | 13.0 |
+| Python | 3.12 |
+
+> The container's torch is a **custom NGC build**. PyPI `torchaudio` / `torchcodec`
+> wheels link against stock PyTorch's C++ ABI and will **not** load against it, so
+> those two must be **built from source** against the installed torch (the scripts
+> below do this). `bitsandbytes` (the 8-bit optimizer) is installed via pip.
+
 ```bash
-# Pull and run the NeMo container
+# Pull and run the NeMo 26.02 container
 docker run -it -u=0 --gpus=all --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -v $WORKSPACE:$WORKSPACE \
-    nvcr.io/nvidia/nemo:25.09 bash
+    nvcr.io/nvidia/nemo:26.02 bash
 
 # Inside the container
 cd $WORKSPACE
 git clone https://github.com/YK-Fu/StreamingASR
 cd StreamingASR
 
-# Install k2 for pruned RNN-T loss calculation
-bash install_k2.sh
+# (one-time) system audio backends needed to build/run torchaudio + torchcodec
+apt update && apt install -y ffmpeg sox libavdevice-dev
 
-# Install torchaudio
-bash /opt/NeMo/scripts/installers/install_torchaudio_latest.sh
+# One-shot install of everything: k2, torchaudio + torchcodec (built from source
+# against the container's torch 2.10), and bitsandbytes (8-bit AdamW optimizer).
+bash install.sh
+
+# Or install only selected components, e.g.:
+#   bash install.sh k2 bitsandbytes
 ```
 
 ## Data Preparation
@@ -178,7 +196,7 @@ StreamingASR/
 │   └── extractor.py                # Mel feature extractor
 ├── asr_train.py                    # RNN-T training script
 ├── distiller_train.py              # Distillation training script
-└── install_k2.sh                   # k2 installation script
+└── install.sh                      # one-shot installer: k2, torchaudio, torchcodec, bitsandbytes
 ```
 
 ## References
