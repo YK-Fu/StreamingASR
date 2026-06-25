@@ -34,6 +34,59 @@
 
 set -euo pipefail
 
+# --- Install location --------------------------------------------------------
+# Install into the active environment's site-packages (the same place as torch and
+# every other package), NOT the Debian/Ubuntu per-user ~/.local fallback that pip
+# uses when it is run neither as root nor inside a venv. PIP_USER=false overrides
+# that distro default; run this script as root or with the target venv activated so
+# the environment's site-packages is writable.
+export PIP_USER=false
+PIP_INSTALL=(python3 -m pip install --root-user-action=ignore)
+
+# Remove EVERY existing copy of a package from the active interpreter's site-packages
+# before a source rebuild. setup.py-style .egg-info and pip .dist-info can co-exist
+# (that is the "two torchaudio" cause), and `pip uninstall` leaves egg-info behind, so
+# we loop uninstall and then sweep the leftovers. Targets the active python3's purelib.
+pip_purge() {
+  local pkg="$1"
+  for _ in 1 2 3; do python3 -m pip uninstall -y "$pkg" >/dev/null 2>&1 || true; done
+  python3 - "$pkg" <<'PY'
+import sys, os, glob, shutil, sysconfig
+pkg = sys.argv[1]
+sp = sysconfig.get_paths()["purelib"]
+for pat in (pkg, pkg + "-*.egg-info", pkg + "-*.dist-info", pkg + "*.egg-link"):
+    for p in glob.glob(os.path.join(sp, pat)):
+        shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
+        print(f"  purged stale: {p}")
+PY
+}
+
+# Verify a freshly installed package: (1) imported from the env, not ~/.local, and
+# (2) exactly one install record (no leftover duplicate version like the old 2.8/2.9).
+verify_install() {
+  python3 - "$1" <<'PY'
+import importlib, os, glob, sys, sysconfig
+m = sys.argv[1]
+mod = importlib.import_module(m)
+path = os.path.dirname(getattr(mod, "__file__", "") or "")
+print(f"  {m} -> {path}  (version {getattr(mod, '__version__', '?')})")
+assert ".local" not in path, (
+    f"{m} installed under ~/.local. Re-run as root or activate the target venv "
+    f"(the env site-packages must be writable)."
+)
+# enroot/pyxis: `enroot export` snapshots only the image rootfs, NOT $HOME or
+# bind-mounts. A package under $HOME will be MISSING from an exported .sqsh.
+home = os.environ.get("HOME", "")
+if home and path.startswith(home):
+    print(f"  WARNING: {m} is under $HOME ({path}). 'enroot export' will NOT capture it, "
+          f"so it will be missing from an exported image. Install into the image rootfs "
+          f"(/opt or /usr) -- run as root with the container writable.")
+sp = sysconfig.get_paths()["purelib"]
+infos = glob.glob(os.path.join(sp, m + "-*.egg-info")) + glob.glob(os.path.join(sp, m + "-*.dist-info"))
+assert len(infos) <= 1, f"{m}: multiple install records remain -> {infos}"
+PY
+}
+
 # --- Component selection -----------------------------------------------------
 COMPONENTS=("$@")
 if [ ${#COMPONENTS[@]} -eq 0 ]; then
@@ -89,11 +142,12 @@ fi
 # --- 1) k2 -------------------------------------------------------------------
 if want k2; then
   echo; echo "### [1/4] installing k2 ###"
-  pip install wheel setuptools cmake
-  K2_MAKE_ARGS="-j" pip install -v --no-build-isolation "git+${K2_REPO}@${K2_COMMIT}#egg=k2" \
+  "${PIP_INSTALL[@]}" wheel setuptools cmake
+  K2_MAKE_ARGS="-j" "${PIP_INSTALL[@]}" -v --no-build-isolation "git+${K2_REPO}@${K2_COMMIT}#egg=k2" \
     || { echo "k2 could not be installed!"; exit 1; }
   python3 -m k2.version > /dev/null \
     || { echo "k2 installed with errors! Please check installation manually."; exit 1; }
+  verify_install k2
   echo "k2 installed successfully!"
 fi
 
@@ -104,18 +158,23 @@ if want torchaudio; then
   BUILD_VERSION="${BUILD_VERSION:-${TA_VER}.0}"
   echo "  build version: ${BUILD_VERSION} | USE_CUDA=${USE_CUDA} USE_FFMPEG=${USE_FFMPEG} BUILD_SOX=${BUILD_SOX}"
 
+  pip_purge torchaudio   # remove any prior copy (incl. the stale setup.py egg-info) first
+
   rm -rf "${TORCHAUDIO_BUILD_DIR}"
   git clone --depth 1 --branch "${TORCHAUDIO_BRANCH}" https://github.com/pytorch/audio.git "${TORCHAUDIO_BUILD_DIR}"
   ( cd "${TORCHAUDIO_BUILD_DIR}"
     git submodule update --init --recursive
     # PYTORCH_VERSION must match the installed torch for CUDA support (some NGC
     # images set it but wrong).
+    # pip install . (not the deprecated setup.py install) so it honors PIP_USER and
+    # lands in the env site-packages like everything else. --no-build-isolation builds
+    # against the installed torch; --no-deps keeps pip from swapping it out.
     USE_CUDA="${USE_CUDA}" \
     USE_FFMPEG="${USE_FFMPEG}" \
     BUILD_SOX="${BUILD_SOX}" \
     PYTORCH_VERSION="${TORCH_FULL_VERSION}" \
     BUILD_VERSION="${BUILD_VERSION}" \
-      python setup.py install )
+      "${PIP_INSTALL[@]}" . --no-build-isolation --no-deps )
   rm -rf "${TORCHAUDIO_BUILD_DIR}"
 
   python3 - <<'PY'
@@ -128,6 +187,7 @@ PY
     python3 -c "from torchaudio.functional import rnnt_loss; print('torchaudio CUDA ops present:', rnnt_loss is not None)" \
       || echo "WARNING: torchaudio built but CUDA op import failed."
   fi
+  verify_install torchaudio
   echo "torchaudio installed successfully!"
 fi
 
@@ -138,8 +198,10 @@ if want torchcodec; then
     echo "ERROR: FFmpeg dev headers not found. Install dependencies first: '${DEPENDENCIES_INSTALL_CMD}'"
     exit 1
   fi
-  pip install -q wheel setuptools cmake ninja pybind11
+  "${PIP_INSTALL[@]}" -q wheel setuptools cmake ninja pybind11
   echo "  ENABLE_CUDA=${ENABLE_CUDA}"
+
+  pip_purge torchcodec   # remove any prior copy first
 
   rm -rf "${TORCHCODEC_BUILD_DIR}"
   git clone --depth 1 --branch "${TORCHCODEC_TAG}" https://github.com/pytorch/torchcodec.git "${TORCHCODEC_BUILD_DIR}"
@@ -150,7 +212,7 @@ if want torchcodec; then
   ( cd "${TORCHCODEC_BUILD_DIR}"
     ENABLE_CUDA="${ENABLE_CUDA}" \
     I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
-      pip install . --no-build-isolation --no-deps )
+      "${PIP_INSTALL[@]}" . --no-build-isolation --no-deps )
   rm -rf "${TORCHCODEC_BUILD_DIR}"
 
   python3 - <<'PY'
@@ -158,6 +220,7 @@ import torch, torchaudio, torchcodec
 from torchcodec.decoders import AudioDecoder  # noqa: F401
 print("torchcodec", torchcodec.__version__, "loaded OK")
 PY
+  verify_install torchcodec
   echo "torchcodec installed successfully!"
 fi
 
@@ -165,12 +228,13 @@ fi
 if want bitsandbytes; then
   echo; echo "### [4/4] installing bitsandbytes (${BNB_VERSION}) ###"
   # --no-deps so pip never swaps out the container's custom torch for a stock wheel.
-  pip install --no-deps "bitsandbytes==${BNB_VERSION}"
+  "${PIP_INSTALL[@]}" --no-deps "bitsandbytes==${BNB_VERSION}"
   python3 - <<'PY'
 import bitsandbytes as bnb
 from bitsandbytes.optim import AdamW8bit  # the optimizer the training scripts register
 print("bitsandbytes", bnb.__version__, "AdamW8bit OK")
 PY
+  verify_install bitsandbytes
   echo "bitsandbytes installed successfully!"
 fi
 
