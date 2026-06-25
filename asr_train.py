@@ -42,21 +42,10 @@ def main(cfg):
         # 6 audio shapes (5s-step chunks) × encoder + decoder dynamic graph + ctc/llm/joint
         # dynamic graphs + val-time shapes. 20 is conservative headroom; dynamo will warn
         # before exceeding.
-        torch._dynamo.config.cache_size_limit = 20
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        torch._dynamo.config.cache_size_limit = 32
         typecheck.set_typecheck_enabled(False)  # prevent wrapt from blocking dynamo tracing
-        # Compile strategy:
-        #   - encoder: dynamic=False, max-autotune-no-cudagraphs → 6 per-shape specialized
-        #     compiles (one per audio_chunk_step bucket). Each Triton kernel is autotuned
-        #     for its specific shape. Cudagraphs disabled because they require static
-        #     shapes across the WHOLE step, which we can't guarantee (text U varies).
-        #   - decoder: dynamic=True, max-autotune-no-cudagraphs → one shape-polymorphic
-        #     graph handling all text lengths. Inductor still picks decent kernels per
-        #     runtime shape; we just lose constant-folding on U.
-        #   - ctc_decoder / llm_head / joint.joint_after_projection: dynamic=True with
-        #     default mode. These are short fusion chains; max-autotune costs more compile
-        #     time than it saves at runtime for such small graphs.
-        # k2 RNNT loss ops sit outside all of these compile boundaries (uncompilable —
-        # custom autograd functions with non-traceable CUDA kernels).
+
         enc_ckpt = cfg.model.get("encoder", {}).get("gradient_checkpointing", False)
         dec_ckpt = cfg.model.get("decoder", {}).get("gradient_checkpointing", False)
         if enc_ckpt or dec_ckpt:
@@ -66,16 +55,11 @@ def main(cfg):
                 "This reduces compile speedup from ~4.6x to ~3%. "
                 "Set gradient_checkpointing: false in config for full benefit."
             )
-        logging.info(
-            "torch.compile enabled: encoder (dynamic=False, max-autotune-no-cudagraphs), "
-            "decoder (dynamic=True, max-autotune-no-cudagraphs), "
-            "ctc_decoder/llm_head/joint.joint_after_projection (dynamic=True)"
-        )
         asr_model.encoder = torch.compile(
             asr_model.encoder, dynamic=False, fullgraph=False
         )
         asr_model.decoder = torch.compile(
-            asr_model.decoder, dynamic=True, fullgraph=False, mode='max-autotune-no-cudagraphs'
+            asr_model.decoder, dynamic=False, fullgraph=True
         )
         asr_model.ctc_decoder = torch.compile(
             asr_model.ctc_decoder, dynamic=False, fullgraph=True
@@ -84,7 +68,7 @@ def main(cfg):
         # contains k2 calls that dynamo can't trace. joint_after_projection captures
         # the broadcast-add + SiLU + Dropout + Linear + log_softmax fusion.
         asr_model.joint.joint_after_projection = torch.compile(
-            asr_model.joint.joint_after_projection, dynamic=False, fullgraph=True
+            asr_model.joint.joint_after_projection, dynamic=True, fullgraph=True
         )
 
     gc.freeze()  # Prevent GC from scanning model objects in forked DataLoader workers (CoW mitigation)

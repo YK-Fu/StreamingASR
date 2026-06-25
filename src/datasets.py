@@ -246,6 +246,7 @@ class ASRDataset(Dataset):
         audio_chunk_step: Optional[float] = None,
         bucket_by: Literal['audio', 'text', None] = 'audio',
         drop_last: bool = False,
+        text_bucket_size: int = None,
         augmentation=None,
     ):
         super().__init__()
@@ -389,8 +390,16 @@ class ASRDataset(Dataset):
         else:
             effective_max = self.audio_chunk_size
         waveforms = pad_list_of_tensors(waveforms, pad_value=0, max_length=effective_max)
-        context = pad_list_of_tensors(context_list, pad_value=self.tokenizer.pad_id)
-        target = pad_list_of_tensors(target_list, pad_value=self.tokenizer.pad_id)
+        def _bucket_len(lengths):
+            n = max(lengths)
+            b = self.text_bucket_size
+            return ((n + b - 1) // b) * b if b else None
+        context = pad_list_of_tensors(
+            context_list, pad_value=self.tokenizer.pad_id,
+            max_length=_bucket_len([t.size(0) for t in context_list]))
+        target = pad_list_of_tensors(
+            target_list, pad_value=self.tokenizer.pad_id,
+            max_length=_bucket_len([t.size(0) for t in target_list]))
         
         # Create attention mask (1 for real tokens, 0 for padding)
         attn_mask = (context != self.tokenizer.pad_id).long()
@@ -461,6 +470,7 @@ def get_asr_dataset(
     audio_chunk_step: Optional[float] = None,
     bucket_by: Literal['audio', 'text', None] = 'audio',
     drop_last: bool = False,
+    text_bucket_size = None,
     augmentation=None,
 ) -> Dataset:
     # Handle None case (no manifest configured)
@@ -493,5 +503,6 @@ def get_asr_dataset(
         audio_chunk_step=audio_chunk_step,
         bucket_by=bucket_by,
         drop_last=drop_last,
+        text_bucket_size=text_bucket_size,
         augmentation=augmentation,
     )

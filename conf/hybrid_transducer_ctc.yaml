@@ -45,6 +45,7 @@ model:
     max_duration: 30
     min_duration: 0.1
     drop_last: true
+    text_bucket_size: 128
     audio_chunk_size: 30  # maximum audio length in seconds; audio longer than this is truncated
     audio_chunk_step: 5   # pad each batch to the next multiple of this value (seconds), up to audio_chunk_size
     bucket_by: "audio"  # Bucket by 'audio' or 'text' length for efficient batching
@@ -134,7 +135,7 @@ model:
       attention_bias: false
       attention_dropout: 0.0
       mlp_bias: false
-      attn_implementation: "flash_attention_2"
+      attn_implementation: "eager"
       tie_word_embeddings: true
 
   # Dedicated projections for the pruned RNN-T smoothed loss (icefall simple_am_proj /

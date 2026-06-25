@@ -240,11 +240,31 @@ class PrunedRNNTJoint(RNNTJoint):
                     "`fuse_loss_wer` is set, therefore encoder and target lengths " "must be provided as well!"
                 )
             if simple_lm is not None and simple_am is not None:
-                symbols = transcripts[..., 1:]
-                boundary = torch.zeros((encoder_outputs.shape[0], 4), dtype=torch.int64, device=encoder_outputs.device)
-                boundary[:, 0] = target_start - 1
-                boundary[:, 2] = target_end - 1
-                boundary[:, 3] = encoder_lengths
+                # Re-index the RNN-T symbol axis to start at the first TRANSCRIPT token
+                # (boundary s_begin = 0). The decoder is causal over [prompt ; transcript],
+                # so the predictor states for the transcript region already encode the prompt
+                # as left-context; we just gather them. Encoding the prompt skip via a
+                # nonzero s_begin instead breaks k2 pruning: the kept window at frame 0 is
+                # [0, s_range) but the boundary forces the path to start at (s_begin, 0), so
+                # whenever s_begin >= s_range no path survives the pruned lattice -> +inf.
+                B = transcripts.shape[0]
+                target_lens = target_end - target_start          # (B,) transcript lengths U
+                # `targets` is already the padded transcript tokens, i.e. exactly
+                # context[target_start : target_end], so it IS the symbol sequence
+                # (s = 0..U-1) — no per-sample gather and no .max().item() host sync needed.
+                symbols = targets
+                max_u = targets.shape[1]
+                # predictor states s = 0..U  <-  the causal decoder states that predict
+                # transcript tokens 0..U-1, plus the post-last state for the termination
+                # transition: positions target_start-1 .. target_start-1+max_u (length max_u+1).
+                ar_lm = torch.arange(max_u + 1, device=transcripts.device)
+                lm_idx = ((target_start - 1).unsqueeze(1) + ar_lm).clamp_(0, decoder_outputs.shape[1] - 1)
+                simple_lm = simple_lm.gather(1, lm_idx.unsqueeze(-1).expand(-1, -1, simple_lm.shape[-1]))
+                decoder_outputs = decoder_outputs.gather(1, lm_idx.unsqueeze(-1).expand(-1, -1, decoder_outputs.shape[-1]))
+
+                boundary = torch.zeros((B, 4), dtype=torch.int64, device=encoder_outputs.device)
+                boundary[:, 2] = target_lens                     # s_end = U  (s_begin stays 0)
+                boundary[:, 3] = encoder_lengths                 # t_end = T (acoustic side full)
 
                 # k2 RNNT kernels are not safe under bf16/fp16 autocast even with
                 # fp32-cast inputs — autocast can still affect internal ops. Disable
@@ -306,7 +326,6 @@ class PrunedRNNTJoint(RNNTJoint):
                 # nan_to_num first: inf * 0 = nan in IEEE 754, which would survive sum()
                 simple_loss = simple_loss.nan_to_num(0.0) * simple_finite
                 rnnt_loss   = rnnt_loss.nan_to_num(0.0) * rnnt_finite
-                target_lens = target_end - target_start
                 simple_tokens = (target_lens * simple_finite).sum().clamp(min=1)
                 rnnt_tokens   = (target_lens * rnnt_finite).sum().clamp(min=1)
                 simple_loss = simple_loss.sum() / simple_tokens
@@ -328,9 +347,10 @@ class PrunedRNNTJoint(RNNTJoint):
 
                 # Seed the greedy RNN-T decoder with the same prompt prefix the
                 # model was trained on: context[:, :target_start] = [bos, <language>, ...].
-                # Training never scores the bos-only predictor state (boundary
-                # s_begin = target_start - 1 >= 1), so decoding from bos alone is
-                # out-of-distribution for the joint and emits only blanks. Slice to
+                # The loss aligns the transcript starting from the post-prompt predictor
+                # state (s=0 is the causal decoder state at target_start-1), so the joint
+                # is only ever trained on prompt-conditioned predictor states; decoding
+                # from bos alone is out-of-distribution and emits only blanks. Slice to
                 # the COMMON prefix (min target_start) so no transcription token is
                 # ever leaked for variable-length prompts.
                 prompt_len = int(target_start.min().item())

@@ -200,6 +200,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             audio_chunk_step=config.get('audio_chunk_step', None),
             bucket_by=config.get('bucket_by', 'audio'),
             drop_last=config.get('drop_last', True),
+            text_bucket_size=config.get('text_bucket_size', None),
             augmentation=config.get('augmentation', None),
         )
         if dataset is None:
