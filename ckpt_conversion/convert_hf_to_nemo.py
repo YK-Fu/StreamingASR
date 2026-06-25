@@ -16,7 +16,7 @@ import argparse
 import torch
 from typing import Dict, Optional
 from collections import OrderedDict
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 import lightning.pytorch as pl
 from lightning.pytorch import seed_everything
@@ -334,6 +334,12 @@ def main():
     
     config = OmegaConf.load(args.config)
     seed_everything(config.seed)
+    with open_dict(config):
+        config.trainer.devices = 1
+        config.trainer.num_nodes = 1
+        config.model.train_ds.manifest_filepath = []
+        config.model.validation_ds.manifest_filepath = []
+        config.model.test_ds.manifest_filepath = []
     dummy_trainer = pl.Trainer(**resolve_trainer_cfg(config.trainer))
     # Validate arguments
     if config.model.get("teacher", None) is not None:

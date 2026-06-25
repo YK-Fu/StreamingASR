@@ -25,7 +25,7 @@ import tempfile
 import torch
 from typing import Dict, Optional
 from collections import OrderedDict
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 import lightning.pytorch as pl
 from lightning.pytorch import seed_everything
@@ -203,6 +203,13 @@ def init_joint_from_ctc(model):
 
     Falls back gracefully when CTC head is single-layer (hidden_dims=[], legacy
     SimpleProj) or when joint.enc is Identity (joint_hidden == enc_hidden).
+
+    Additionally initializes the pruned-RNN-T simple projections so their
+    prune-range scores start aligned with the trained heads instead of random:
+        ctc_decoder (full state)    -> simple_am_proj           (identical ProjHead)
+        decoder lm_head.weight      -> simple_lm_proj.decoder_layers.weight
+    The acoustic side (simple_am_proj) mirrors the CTC head; the label side
+    (simple_lm_proj) mirrors the Qwen LM head's next-token projection.
     """
     import torch.nn as nn
 
@@ -293,6 +300,56 @@ def init_joint_from_ctc(model):
             f"CTC-init equivalence is approximate."
         )
 
+    # --- simple_am_proj <- CTC head ---
+    # simple_am_proj and ctc_decoder are configured as the same ProjHead
+    # (feat_in=encoder.d_model, hidden_dims=[joint_hidden]), so the CTC head's
+    # state transfers 1:1. Shape-filter for robustness across config drift.
+    simple_am = getattr(model, 'simple_am_proj', None)
+    if simple_am is None:
+        print("\n  simple_am_proj not present — skipping CTC-head copy.")
+    else:
+        print("\n=== Initializing simple_am_proj from CTC head ===")
+        src_state = model.ctc_decoder.state_dict()
+        tgt_state = simple_am.state_dict()
+        filtered, mismatched = {}, []
+        for k, v in src_state.items():
+            if k in tgt_state and tgt_state[k].shape != v.shape:
+                mismatched.append((k, tuple(v.shape), tuple(tgt_state[k].shape)))
+            else:
+                filtered[k] = v
+        if mismatched:
+            print("  WARNING: shape-mismatched keys (kept at random init):")
+            for k, src_shape, dst_shape in mismatched[:5]:
+                print(f"    {k}: src {src_shape} -> dst {dst_shape}")
+        missing, unexpected = simple_am.load_state_dict(filtered, strict=False)
+        if missing:
+            print(f"  Missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Missing keys: {missing}")
+        if unexpected:
+            print(f"  Unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Unexpected keys: {unexpected}")
+        print(f"  simple_am_proj initialized from CTC head ({len(filtered)}/{len(src_state)} keys transferred).")
+
+    # --- simple_lm_proj <- decoder LM head ---
+    # simple_lm_proj is a single-Linear ProjHead (hidden_dims=[]): its
+    # decoder_layers.weight is (vocab, hidden) and matches the Qwen lm_head
+    # weight (both bias-free, rows already trimmed to the tokenizer vocab).
+    simple_lm = getattr(model, 'simple_lm_proj', None)
+    if simple_lm is None:
+        print("\n  simple_lm_proj not present — skipping LM-head copy.")
+    elif not hasattr(simple_lm, 'decoder_layers'):
+        print("\n  simple_lm_proj has no decoder_layers (tie_weights?) — skipping LM-head copy.")
+    else:
+        print("\n=== Initializing simple_lm_proj from decoder LM head ===")
+        lm_head_weight = model.decoder.prediction.lm_head.weight
+        tgt_weight = simple_lm.decoder_layers.weight
+        if tgt_weight.shape != lm_head_weight.shape:
+            print(
+                f"  WARNING: simple_lm_proj.decoder_layers weight {tuple(tgt_weight.shape)} "
+                f"mismatches lm_head weight {tuple(lm_head_weight.shape)} — skipping copy."
+            )
+        else:
+            tgt_weight.data.copy_(lm_head_weight)
+            print(f"  Copied lm_head weight {tuple(lm_head_weight.shape)} -> simple_lm_proj.decoder_layers.")
+
 
 def load_qwen_decoder_weights(qwen_path, model):
     """
@@ -319,13 +376,14 @@ def load_qwen_decoder_weights(qwen_path, model):
         print(f"  Decoder unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Decoder unexpected keys: {unexpected}")
     print("  Decoder + native lm_head weights loaded successfully")
 
-    # --- Dedicated pruned-RNN-T simple projections: RANDOM init (NOT from Qwen or the
-    # distilled CTC head). simple_am_proj / simple_lm_proj are icefall-style and start
-    # from scratch (already random-initialized by the model __init__ with the configured
-    # simple_proj.init_scale); the loss-warmup phase trains them before pruning kicks in. ---
+    # --- Dedicated pruned-RNN-T simple projections: left at __init__ random init here.
+    # simple_am_proj / simple_lm_proj are icefall-style; with --init-joint-from-ctc they
+    # are subsequently initialized from the CTC head and the LM head respectively (see
+    # init_joint_from_ctc, which runs after this). Otherwise they stay at the configured
+    # simple_proj.init_scale random init and the loss-warmup phase trains them. ---
     for name in ("simple_am_proj", "simple_lm_proj"):
         if getattr(model, name, None) is not None:
-            print(f"  {name}: kept at __init__ random init (config simple_proj.init_scale); NOT loaded from Qwen/CTC")
+            print(f"  {name}: kept at __init__ random init for now (use --init-joint-from-ctc to seed from CTC/LM head)")
 
 
 def main():
@@ -390,6 +448,12 @@ def main():
     # Load config and create dummy trainer
     config = OmegaConf.load(args.config)
     seed_everything(config.seed)
+    with open_dict(config):
+        config.trainer.devices = 1
+        config.trainer.num_nodes = 1
+        config.model.train_ds.manifest_filepath = []
+        config.model.validation_ds.manifest_filepath = []
+        config.model.test_ds.manifest_filepath = []
     dummy_trainer = pl.Trainer(**resolve_trainer_cfg(config.trainer))
 
     # Load distillation checkpoint
