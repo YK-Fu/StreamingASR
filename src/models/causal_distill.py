@@ -41,6 +41,8 @@ from nemo.utils.model_utils import maybe_update_config_version
 from src.loss import CTCLoss, CosineSimilarityLoss, MSELoss
 from src.decoding_utils import CTCDecoding
 from src.datasets import get_asr_dataset, ResumableDataloader, ResumableSampler
+from src.modules.projection import DistilTimeUpsampler
+
 
 class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
     """Base class for encoder decoder RNNT-based models with auxiliary CTC decoder/loss and subword tokenization."""
@@ -76,6 +78,27 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         self.teacher = CausalWhisperDistilModel.from_config_dict(self.cfg.teacher)
         self.teacher.eval()
         self.student = CausalWhisperDistilModel.from_config_dict(self.cfg.student)
+
+        # If the student subsamples more than the teacher (e.g. student 8x vs teacher
+        # 2x), the student output is shorter in time and cannot be compared frame-for-
+        # frame with the teacher. Add a time-upsampling projector (activation + Linear +
+        # sub-pixel reshape) applied ONLY to the distillation loss path.
+        teacher_sf = getattr(self.teacher, 'subsampling_factor', 2)
+        student_sf = getattr(self.student, 'subsampling_factor', 2)
+        if student_sf % teacher_sf != 0:
+            raise ValueError(
+                f"student subsampling factor ({student_sf}) must be a multiple of the "
+                f"teacher's ({teacher_sf}) so student frames upsample to teacher frames")
+        distil_ratio = student_sf // teacher_sf
+        if distil_ratio > 1:
+            proj_act = self.cfg.distil_loss.get('projector_activation', 'gelu')
+            self.distil_projector = DistilTimeUpsampler(self.cfg.student.d_model, distil_ratio, proj_act)
+            logging.info(
+                f"Distillation frame-rate ratio student/teacher = {distil_ratio}; added "
+                f"time-upsampling projector Linear({self.cfg.student.d_model}, "
+                f"{distil_ratio * self.cfg.student.d_model}) on the distil-loss path.")
+        else:
+            self.distil_projector = None
 
         loss_type = self.cfg.distil_loss.get('type', 'cosine')
         self.distil_loss_scale = self.cfg.distil_loss.get('scale', 10.0)
@@ -196,8 +219,19 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         teacher_encoded = self.forward(input_signal=teacher_signal, mode='teacher')
         encoded_len = torch.full((student_encoded.shape[0],), student_encoded.shape[2], device=student_encoded.device)
 
-        distil_loss = self.distil_loss(student_encoded, teacher_encoded)
-        del teacher_encoded  # free 2× encoder output (~30 MB bf16) before next large alloc
+        # Match the student frame rate to the teacher for the distillation loss only.
+        # The CTC head below still consumes the low-rate `student_encoded`.
+        if self.distil_projector is not None:
+            student_for_distil = self.distil_projector(student_encoded)
+            # conv floor-rounding can leave the upsampled length a few frames off the
+            # teacher's; align on the shorter length before the elementwise/cosine loss.
+            if student_for_distil.shape[2] != teacher_encoded.shape[2]:
+                L = min(student_for_distil.shape[2], teacher_encoded.shape[2])
+                student_for_distil, teacher_encoded = student_for_distil[..., :L], teacher_encoded[..., :L]
+        else:
+            student_for_distil = student_encoded
+        distil_loss = self.distil_loss(student_for_distil, teacher_encoded)
+        del teacher_encoded, student_for_distil  # free before next large alloc
 
         # Reset access registry
         if AccessMixin.is_access_enabled(self.model_guid):
@@ -343,9 +377,16 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
 
         tensorboard_logs = {}
         # distil_loss already incorporates the scale internally (CosineSimilarityLoss(scale=...))
-        distil_loss = self.distil_loss(student_encoded, teacher_encoded)
+        if self.distil_projector is not None:
+            student_for_distil = self.distil_projector(student_encoded)
+            if student_for_distil.shape[2] != teacher_encoded.shape[2]:
+                L = min(student_for_distil.shape[2], teacher_encoded.shape[2])
+                student_for_distil, teacher_encoded = student_for_distil[..., :L], teacher_encoded[..., :L]
+        else:
+            student_for_distil = student_encoded
+        distil_loss = self.distil_loss(student_for_distil, teacher_encoded)
         tensorboard_logs['val_distil_loss'] = distil_loss.detach()
-        del teacher_encoded
+        del teacher_encoded, student_for_distil
 
         ctc_output = self.ctc_decoder(student_encoded, return_logits=False, return_softmax=True)
         del student_encoded

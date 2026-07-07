@@ -111,14 +111,23 @@ class ProjHead(NeuralModule, Exportable):
     def num_classes_with_blank(self):
         return self._num_classes
 
+class DistilTimeUpsampler(torch.nn.Module):
 
-# Back-compat alias — old distill .nemo checkpoints have `_target_:
-# src.modules.projection.SimpleProj` baked into their saved config. SimpleProj's
-# original __init__ signature (feat_in, num_classes, init_mode, vocabulary,
-# tie_weights) is a strict subset of ProjHead's, so existing restores still work
-# (hidden_dims defaults to [], reproducing single-Linear behavior). New configs
-# should use ProjHead directly.
-SimpleProj = ProjHead
+    def __init__(self, d_model: int, ratio: int, activation: str = "gelu"):
+        super().__init__()
+        self.ratio = ratio
+        self.d_model = d_model
+        act = {"gelu": torch.nn.GELU, "silu": torch.nn.SiLU, "swish": torch.nn.SiLU,
+               "relu": torch.nn.ReLU}[activation.lower()]
+        self.act = act()
+        self.proj = torch.nn.Linear(d_model, ratio * d_model)
+
+    def forward(self, x):                       # x: (B, D, T)
+        x = x.transpose(1, 2)                   # (B, T, D)
+        x = self.proj(self.act(x))              # (B, T, ratio*D)
+        b, t, _ = x.shape
+        x = x.reshape(b, t, self.ratio, self.d_model).reshape(b, t * self.ratio, self.d_model)
+        return x.transpose(1, 2)                # (B, D, T*ratio)
 
 
 class PrunedRNNTJoint(RNNTJoint):

@@ -115,6 +115,11 @@ model:
     gradient_checkpointing: false       # Set to true to enable gradient checkpointing. This reduces the memory usage of the model.
     freeze: false                       # Set to true to freeze the encoder.
     freeze_ffn: false                   # Set to true to freeze the ffn network in each of the transformer blocks. This reduces the memory usage of the model.
+    pre_encode:
+      layers: [1280, 1280, 1280]
+      stride: [2, 2, 2]
+      kernel_size: 3
+      activation: gelu
 
   decoder:
     _target_: src.modules.transformer_decoder.LLMDecoder

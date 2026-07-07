@@ -14,6 +14,7 @@
 # 
 # Modifications Copyright (c) 2026, Iven Fu. All rights reserved.
 
+import math
 from collections import OrderedDict
 
 import torch
@@ -87,6 +88,7 @@ class WhisperEncoder(NeuralModule, AccessMixin):
         freeze: bool = False,
         freeze_ffn: bool = False,
         position_embedding_type: str = "alibi",
+        pre_encode=None,
     ):
         """
         Args:
@@ -121,7 +123,6 @@ class WhisperEncoder(NeuralModule, AccessMixin):
         self.d_model = d_model
         self.n_layers = n_layers
         self._feat_in = feat_in
-        self.subsampling_factor = 2
         if language_file is not None:
             self.language_mapping = {}
             with open(language_file, 'r') as f:
@@ -132,14 +133,31 @@ class WhisperEncoder(NeuralModule, AccessMixin):
             self.language_mapping = None
 
         self.gradient_checkpointing = gradient_checkpointing
-        # Subsampling
-        self.pre_encode = nn.Sequential(
-            nn.Conv1d(feat_in, d_model, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, stride=2),
-            nn.GELU(),
-            nn.Dropout(dropout_pre_encoder),
-        )
+        if pre_encode is None:
+            pre_encode = {"layers": [d_model, d_model], "stride": [1, 2],
+                          "kernel_size": 3, "activation": "gelu"}
+        pe_channels = list(pre_encode["layers"])
+        pe_strides = list(pre_encode["stride"])
+        pe_kernel = int(pre_encode.get("kernel_size", 3))
+        pe_act = str(pre_encode.get("activation", "gelu")).lower()
+        if len(pe_channels) != len(pe_strides):
+            raise ValueError(
+                f"pre_encode.layers ({len(pe_channels)}) and pre_encode.stride "
+                f"({len(pe_strides)}) must have the same length")
+        if pe_channels[-1] != d_model:
+            raise ValueError(
+                f"pre_encode.layers[-1] ({pe_channels[-1]}) must equal d_model ({d_model})")
+        _act = {"gelu": nn.GELU, "silu": nn.SiLU, "swish": nn.SiLU, "relu": nn.ReLU}[pe_act]
+        _pre = []
+        in_ch = feat_in
+        for out_ch, st in zip(pe_channels, pe_strides):
+            _pre.append(nn.Conv1d(in_ch, out_ch, kernel_size=pe_kernel,
+                                  padding=pe_kernel // 2, stride=st))
+            _pre.append(_act())
+            in_ch = out_ch
+        _pre.append(nn.Dropout(dropout_pre_encoder))
+        self.pre_encode = nn.Sequential(*_pre)
+        self.subsampling_factor = math.prod(pe_strides)
         if self.language_mapping is not None:
             self.language_embedding = nn.Embedding(len(self.language_mapping), d_model)
         else:
