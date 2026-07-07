@@ -169,6 +169,83 @@ def convert_whisper_encoder_weights(
     return converted
 
 
+def validate_teacher_matches_whisper(hf_model_path: str, teacher_encoder) -> None:
+    """The distillation teacher IS the (frozen) Whisper encoder — it produces the target
+    features, so it must be architecturally identical to Whisper's front-end and MUST NOT
+    downsample any differently. Raise if the teacher's conv subsampling (layer count /
+    strides / kernels / shapes) does not match Whisper's conv1+conv2.
+    """
+    from transformers import WhisperModel
+
+    print("\n=== Validating teacher subsampling matches Whisper ===")
+    hf_model = WhisperModel.from_pretrained(hf_model_path)
+    hf_convs = [hf_model.encoder.conv1, hf_model.encoder.conv2]  # Whisper: exactly 2 conv1d
+    teacher_convs = [m for m in teacher_encoder.pre_encode if isinstance(m, torch.nn.Conv1d)]
+
+    errors = []
+    if len(teacher_convs) != len(hf_convs):
+        errors.append(
+            f"conv layer count: teacher has {len(teacher_convs)}, Whisper has {len(hf_convs)} "
+            f"(the teacher cannot add subsampling layers)")
+    else:
+        for i, (t, w) in enumerate(zip(teacher_convs, hf_convs)):
+            if tuple(t.stride) != tuple(w.stride):
+                errors.append(f"conv{i+1} stride: teacher {tuple(t.stride)} vs Whisper {tuple(w.stride)}")
+            if tuple(t.kernel_size) != tuple(w.kernel_size):
+                errors.append(f"conv{i+1} kernel_size: teacher {tuple(t.kernel_size)} vs Whisper {tuple(w.kernel_size)}")
+            if tuple(t.weight.shape) != tuple(w.weight.shape):
+                errors.append(f"conv{i+1} weight shape: teacher {tuple(t.weight.shape)} vs Whisper {tuple(w.weight.shape)}")
+    del hf_model
+    if errors:
+        raise ValueError(
+            "Teacher encoder must match Whisper's subsampling EXACTLY (the teacher is the "
+            "distillation target and cannot downsample differently):\n  "
+            + "\n  ".join(errors)
+            + "\n\nRestore the teacher's pre_encode to Whisper's 2x front-end, e.g.:\n"
+            "    pre_encode:\n"
+            "      layers: [<d_model>, <d_model>]\n"
+            "      stride: [1, 2]\n"
+            "      kernel_size: 3\n"
+            "(Only the STUDENT may use a higher downsampling factor.)")
+    print(f"  OK: teacher subsampling matches Whisper "
+          f"(2 convs, strides {[tuple(c.stride) for c in teacher_convs]}).")
+
+
+def init_extra_subsampling_convs_as_downsample(encoder, num_whisper_convs: int = 2) -> None:
+    """Initialize conv-subsampling layers BEYOND the two loaded from Whisper.
+
+    Whisper only has two subsampling convs (conv1, conv2 -> pre_encode.0/.2). When the
+    student is configured with a higher downsampling factor it has extra Conv1d layers
+    (pre_encode.4, .6, ...). Those extra convs are initialized as a near-identity
+    TEMPORAL DOWNSAMPLE so that, at init, each added layer barely perturbs the pretrained
+    representation and just subsamples it in time:
+
+        weight = 0 everywhere EXCEPT an identity across channels at the LAST kernel tap
+        (weight[c, c, kernel_size-1] = 1), bias = 0.
+
+    With that kernel, output[c, t] = input[c, t*stride + (kernel_size-1) - padding], i.e.
+    each output frame copies one input frame per stride window (channel-preserving). The
+    first `num_whisper_convs` convs are left untouched (they already hold Whisper weights).
+    """
+    convs = [m for m in encoder.pre_encode if isinstance(m, torch.nn.Conv1d)]
+    for idx, conv in enumerate(convs):
+        if idx < num_whisper_convs:
+            continue  # first two convs already initialized from Whisper conv1/conv2
+        out_ch, in_ch, k = conv.weight.shape
+        n = min(out_ch, in_ch)
+        with torch.no_grad():
+            conv.weight.zero_()
+            # identity across channels at the LAST kernel tap -> strided pass-through
+            conv.weight[torch.arange(n), torch.arange(n), k - 1] = 1.0
+            if conv.bias is not None:
+                conv.bias.zero_()
+        print(f"  pre_encode conv #{idx} (stride={conv.stride[0]}, kernel={k}): "
+              f"initialized as identity-downsample (delta at tap {k - 1})")
+    if len(convs) <= num_whisper_convs:
+        print(f"  pre_encode has {len(convs)} conv layer(s) (<= {num_whisper_convs}); "
+              f"no extra downsample convs to initialize")
+
+
 def convert_qwen_decoder_weights(
     hf_model_path: str,
     vocab_size: int,
@@ -231,6 +308,8 @@ def create_rnnt_model_checkpoint(whisper_path, qwen_path, model):
         print(f"  Encoder missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Encoder missing keys: {missing}")
     if unexpected:
         print(f"  Encoder unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Encoder unexpected keys: {unexpected}")
+    # Extra subsampling convs (beyond Whisper's 2) -> identity-downsample init.
+    init_extra_subsampling_convs_as_downsample(model.encoder)
     print(f"  Encoder weights loaded successfully")
     
     # Convert and load decoder weights (incl. native lm_head) into decoder.prediction
@@ -263,7 +342,9 @@ def create_rnnt_model_checkpoint(whisper_path, qwen_path, model):
 def create_distill_model_checkpoint(whisper_path, model):
     # Validate teacher config before conversion
     validate_whisper_config(whisper_path, model.cfg.teacher)
-    
+    # The teacher must be Whisper's exact front-end (no different downsampling).
+    validate_teacher_matches_whisper(whisper_path, model.teacher)
+
     # Convert and load teacher encoder weights (with position embeddings)
     print(f"\n=== Converting Whisper encoder for teacher ===")
     teacher_state = convert_whisper_encoder_weights(
@@ -276,6 +357,8 @@ def create_distill_model_checkpoint(whisper_path, model):
         print(f"  Teacher missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Teacher missing keys: {missing}")
     if unexpected:
         print(f"  Teacher unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Teacher unexpected keys: {unexpected}")
+    # No extra-conv init for the teacher: validate_teacher_matches_whisper already
+    # guaranteed it has exactly Whisper's 2 subsampling convs.
     print(f"  Teacher weights loaded successfully")
 
     # Convert and load student encoder weights (without position embeddings - ALiBi)
@@ -290,6 +373,8 @@ def create_distill_model_checkpoint(whisper_path, model):
         print(f"  Student missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Student missing keys: {missing}")
     if unexpected:
         print(f"  Student unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Student unexpected keys: {unexpected}")
+    # Higher student downsampling -> extra convs beyond Whisper's 2 get identity-downsample init.
+    init_extra_subsampling_convs_as_downsample(model.student)
     print(f"  Student weights loaded successfully")
 
 

@@ -148,6 +148,22 @@ def load_distill_weights_to_rnnt(distill_state, model):
             print(f"  Missing keys: only slopes (auto-computed for ALiBi)")
     if unexpected:
         print(f"  Unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Unexpected keys: {unexpected}")
+
+    # Hard guard: the RNN-T encoder's conv subsampling MUST match the distilled student's,
+    # otherwise the trained student encoder cannot transfer and the mismatch would be
+    # silent (extra convs land in unexpected/missing and the encoder trains half-random).
+    # pre_encode params are all persistent, so any pre_encode key in missing/unexpected
+    # signals a stride/layer config drift between the distill and RNN-T configs.
+    pre_missing = [k for k in missing if k.startswith('pre_encode')]
+    pre_unexpected = [k for k in unexpected if k.startswith('pre_encode')]
+    if pre_missing or pre_unexpected:
+        raise ValueError(
+            "RNN-T encoder `pre_encode` does not match the distilled student's subsampling.\n"
+            "The RNN-T config's model.encoder.pre_encode (layers/stride/kernel_size) MUST be "
+            "identical to the distill config's model.student.pre_encode, or the trained "
+            "student encoder cannot be transferred.\n"
+            f"  pre_encode keys the RNN-T encoder expected but the student lacks: {pre_missing}\n"
+            f"  pre_encode keys in the student but absent from the RNN-T encoder: {pre_unexpected}")
     print("  Encoder weights loaded successfully")
 
     # Extract and load CTC decoder weights. Strip `_orig_mod.` for safety in case
