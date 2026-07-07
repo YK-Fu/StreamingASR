@@ -117,6 +117,7 @@ class MultiHeadAttention(nn.Module):
             self.register_buffer("slopes", get_alibi_slopes(self.n_heads))
             self._attn_no_cache = {}  # (Q_LEN, KV_LEN, device) -> (score_mod, block_mask)
 
+    @torch._dynamo.disable
     def _get_score_mask_mod(self, q, k, v, cache):
         if self.attn_type == "alibi":
             if cache is None:
