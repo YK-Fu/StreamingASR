@@ -409,6 +409,19 @@ class ASRDataset(Dataset):
         return context, target, attn_mask, target_starts, target_ends, waveforms, language_ids
 
 class ResumableDataloader(DataLoader):
+    def __iter__(self):
+        # Count consumption-side (per batch actually pulled by the training loop), NOT in
+        # the sampler's __iter__: the DataLoader drains the sampler's index stream ahead of
+        # training to fill the worker prefetch queue (num_workers * prefetch_factor), so a
+        # sampler-side counter over-counts by the prefetch depth and resume would skip
+        # batches. Here the generator only advances when the consumer pulls a batch, so
+        # `consumed_batches` tracks true progress (off by <=1 vs Lightning's 1-batch
+        # fetcher). This is the authoritative count read back in on_save_checkpoint.
+        for batch in super().__iter__():
+            if hasattr(self.sampler, 'consumed_batches'):
+                self.sampler.consumed_batches += 1
+            yield batch
+
     def state_dict(self):
         return self.sampler.state_dict()
     def load_state_dict(self, state_dict):
