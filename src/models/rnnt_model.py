@@ -346,6 +346,8 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         if (sample_id + 1) % log_every_n_steps == 0:
             compute_wer = True
+            torch.cuda.empty_cache()
+            gc.collect()
         else:
             compute_wer = False
 
@@ -647,4 +649,26 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             torch.set_rng_state(state_dict['rng_state']['torch'])
             torch.cuda.set_rng_state_all(state_dict['rng_state']['cuda'])
         super().on_load_checkpoint(state_dict)
+
+    def save_to(self, save_path: str):
+        """Export a .nemo whose weights load directly into an UNCOMPILED model.
+
+        When trained with torch.compile, submodules are wrapped so their weights are saved
+        under an `_orig_mod.` prefix (e.g. `encoder._orig_mod.pre_encode.0.weight`). That
+        prefix must be stripped for the .nemo to be usable by init_from_nemo_model /
+        conversion / validation. We strip it ONLY for the .nemo export by temporarily
+        wrapping state_dict() for the duration of save_to. The Lightning resume .ckpt is
+        written by a different path and is left untouched — it keeps `_orig_mod` so a
+        compiled model can self-resume with matching keys.
+        """
+        real_state_dict = self.state_dict
+
+        def stripped_state_dict(*args, **kwargs):
+            return {k.replace("._orig_mod.", "."): v for k, v in real_state_dict(*args, **kwargs).items()}
+
+        self.state_dict = stripped_state_dict
+        try:
+            super().save_to(save_path)
+        finally:
+            self.state_dict = real_state_dict
 
