@@ -56,21 +56,14 @@ def main(cfg):
                 "Set gradient_checkpointing: false in config for full benefit."
             )
         asr_model.encoder = torch.compile(
-            asr_model.encoder, dynamic=False, fullgraph=False
+            asr_model.encoder, dynamic=True, fullgraph=False
         )
         asr_model.decoder = torch.compile(
             asr_model.decoder, dynamic=False, fullgraph=True
         )
         asr_model.ctc_decoder = torch.compile(
-            asr_model.ctc_decoder, dynamic=False, fullgraph=True
+            asr_model.ctc_decoder, dynamic=True, fullgraph=False
         )
-        # Compile only joint_after_projection — the surrounding forward_fused_loss
-        # contains k2 calls that dynamo can't trace. joint_after_projection captures
-        # the broadcast-add + SiLU + Dropout + Linear + log_softmax fusion.
-        asr_model.joint.joint_after_projection = torch.compile(
-            asr_model.joint.joint_after_projection, dynamic=True, fullgraph=True
-        )
-
     gc.freeze()  # Prevent GC from scanning model objects in forked DataLoader workers (CoW mitigation)
     trainer.fit(asr_model)
 
