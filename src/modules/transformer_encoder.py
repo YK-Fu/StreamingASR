@@ -263,10 +263,15 @@ class WhisperEncoder(NeuralModule, AccessMixin):
                 if self.interctc_capture_at_layers is None:
                     self.interctc_capture_at_layers = self.access_cfg.get('interctc', {}).get('capture_layers', [])
                 if lth in self.interctc_capture_at_layers:
-                    lth_audio_signal = audio_signal
+                    lth_audio_signal = audio_signal  # [B, T, D]
                     # shape is the same as the shape of audio_signal output, i.e. [B, D, T]
                     self.register_accessible_tensor(
                         name=f'interctc/layer_output_{lth}', tensor=torch.transpose(lth_audio_signal, 1, 2)
+                    )
+                    B, T = lth_audio_signal.size(0), lth_audio_signal.size(1)
+                    self.register_accessible_tensor(
+                        name=f'interctc/layer_length_{lth}',
+                        tensor=torch.full((B,), T, device=lth_audio_signal.device, dtype=torch.long),
                     )
 
         audio_signal = self.layer_norm(audio_signal)

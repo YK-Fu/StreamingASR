@@ -233,9 +233,11 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         distil_loss = self.distil_loss(student_for_distil, teacher_encoded)
         del teacher_encoded, student_for_distil  # free before next large alloc
 
-        # Reset access registry
-        if AccessMixin.is_access_enabled(self.model_guid):
-            AccessMixin.reset_registry(self)
+        # NOTE: do NOT reset the access registry here. The interctc layer-15 tensor
+        # captured during the student forward must survive until add_interctc_losses()
+        # below. reset_registry() also disables access, which would make
+        # add_interctc_losses() early-return and silently drop the interctc loss.
+        # The end-of-step reset (after add_interctc_losses) handles cleanup.
 
         tensorboard_logs = {
             'train_distil_loss': distil_loss.detach(),
@@ -278,6 +280,11 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         loss_value, additional_logs = self.add_interctc_losses(
             loss_value, target, target_len, compute_wer=compute_wer
         )
+        # add_interctc_losses returns the per-layer interctc metrics (inter_ctc_loss_l15,
+        # inter_wer_l15, final_loss) but does NOT log them itself. Merge them in so they
+        # reach wandb/tensorboard — matches NeMo's stock training_step. The loss itself is
+        # already folded into loss_value above; this only surfaces the breakdown.
+        tensorboard_logs.update(additional_logs)
 
         tensorboard_logs.update({'train_loss': loss_value.detach()})
         if AccessMixin.is_access_enabled(self.model_guid):
@@ -287,6 +294,19 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         self.log_dict(tensorboard_logs)
 
         return {'loss': loss_value}
+
+    @property
+    def encoder(self):
+        # InterCTCMixin.get_captured_interctc_tensors() reads the captured
+        # interctc tensors from self.encoder's submodule registries. Our encoder
+        # is the student. Expose it as a property (not a registered submodule) so
+        # the mixin finds the capture without double-registering student's params.
+        #
+        # If torch.compile wrapped the student in an OptimizedModule, return the
+        # underlying module: named_modules() on the wrapper surfaces the same
+        # _registry under both '' and '_orig_mod', which trips the mixin's
+        # "layer ... has been logged multiple times!" dedup guard.
+        return getattr(self.student, '_orig_mod', self.student)
 
     def forward(self, input_signal, language_ids=None, mode='student'):
         if mode == 'student':
