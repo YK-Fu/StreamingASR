@@ -22,9 +22,10 @@ class LLMDecoder(nn.Module):
             self.prediction.gradient_checkpointing_enable()
         if freeze:
             for name, param in self.named_parameters():
-                if 'embed' in name and config.tie_word_embeddings:
-                    continue
-                param.requires_grad = False
+                if 'embed' in name or 'lm_head' in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
         elif freeze_ffn:
             for name, param in self.named_parameters():
                 if '.mlp.' in name:
