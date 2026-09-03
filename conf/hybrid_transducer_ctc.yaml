@@ -70,11 +70,13 @@ model:
     max_duration: 30
     min_duration: 0.1
     drop_last: true
-    text_bucket_size: 128
-    audio_chunk_size: 30  # maximum audio length in seconds; audio longer than this is truncated
-    audio_chunk_step: 5   # pad each batch to the next multiple of this value (seconds), up to audio_chunk_size
-    bucket_by: "audio"  # Bucket by 'audio' or 'text' length for efficient batching
-
+    text_bucket_size: 64
+    # Left-truncate manifest history to its most recent tokens. BOS, language,
+    # and current-transcript tokens are not counted toward this limit.
+    max_context_tokens: 256
+    audio_chunk_size: 60
+    audio_chunk_step: 5
+    bucket_by: audio
   validation_ds:
     manifest_filepath: 
       - ???
@@ -89,8 +91,8 @@ model:
     pin_memory: true
     audio_chunk_size: ${model.train_ds.audio_chunk_size}
     audio_chunk_step: ${model.train_ds.audio_chunk_step}
-    bucket_by: "audio"
-
+    max_context_tokens: ${model.train_ds.max_context_tokens}
+    bucket_by: audio
   test_ds:
     manifest_filepath: 
       - ???

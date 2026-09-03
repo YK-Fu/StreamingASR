@@ -32,6 +32,11 @@ from nemo.core.classes.mixins import AccessMixin
 from src.loss import CTCLoss, NLLLoss
 from src.decoding_utils import CTCDecoding, RNNTDecoding, WER
 from src.datasets import get_asr_dataset, ResumableDataloader, ResumableSampler
+from src.token_augmentation import (
+    ctc_aligned_token_substitution,
+    ctc_insertion_recovery,
+    mask_token_attention,
+)
 
 class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCTCMixin):
     """Base class for encoder decoder RNNT-based models with auxiliary CTC decoder/loss and subword tokenization."""
@@ -60,6 +65,82 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         num_vocab = self.tokenizer.vocab_size
         self.blank_id = self.tokenizer.token_to_id(self.cfg.tokenizer.blank_token)
+        token_augmentation_cfg = self.cfg.get("token_augmentation", {})
+        ctc_as_input_cfg = token_augmentation_cfg.get("ctc_as_input", {})
+        self.ctc_as_input_enabled = bool(ctc_as_input_cfg.get("enabled", False))
+        self.ctc_as_input_ratio = float(ctc_as_input_cfg.get("ratio", 0.0))
+        if not 0.0 <= self.ctc_as_input_ratio <= 1.0:
+            raise ValueError("token_augmentation.ctc_as_input.ratio must be in [0, 1]")
+
+        attention_mask_cfg = token_augmentation_cfg.get("attention_mask", {})
+        self.token_attention_mask_enabled = bool(
+            attention_mask_cfg.get("enabled", False)
+        )
+        self.token_attention_mask_probability = float(
+            attention_mask_cfg.get("probability", 0.0)
+        )
+        if not 0.0 <= self.token_attention_mask_probability <= 1.0:
+            raise ValueError(
+                "token_augmentation.attention_mask.probability "
+                "must be in [0, 1]"
+            )
+        insertion_cfg = token_augmentation_cfg.get("ctc_insertion", {})
+        self.ctc_insertion_enabled = bool(insertion_cfg.get("enabled", False))
+        self.ctc_insertion_sample_probability = float(
+            insertion_cfg.get("sample_probability", 0.0)
+        )
+        if not 0.0 <= self.ctc_insertion_sample_probability <= 1.0:
+            raise ValueError(
+                "token_augmentation.ctc_insertion.sample_probability "
+                "must be in [0, 1]"
+            )
+        enabled_history_augmentations = sum(
+            (
+                self.ctc_as_input_enabled,
+                self.token_attention_mask_enabled,
+                self.ctc_insertion_enabled,
+            )
+        )
+        if enabled_history_augmentations > 1:
+            raise ValueError(
+                "ctc_as_input, attention_mask, and ctc_insertion are mutually "
+                "exclusive token augmentations"
+            )
+
+        text_bucket_size = self.cfg.train_ds.get("text_bucket_size", None)
+        self.token_augmentation_text_bucket_size = (
+            int(text_bucket_size) if text_bucket_size is not None else None
+        )
+        if (
+            self.token_augmentation_text_bucket_size is not None
+            and self.token_augmentation_text_bucket_size < 1
+        ):
+            raise ValueError("model.train_ds.text_bucket_size must be positive or null")
+
+        protected_token_ids = set(self.tokenizer.tokenizer.all_special_ids)
+        protected_token_ids.add(self.blank_id)
+        self.register_buffer(
+            "_token_augmentation_protected_ids",
+            torch.tensor(sorted(protected_token_ids), dtype=torch.long),
+            persistent=False,
+        )
+
+        if self.ctc_as_input_enabled:
+            logging.info(
+                "CTC-as-input scheduled sampling enabled: "
+                f"token_ratio={self.ctc_as_input_ratio}"
+            )
+        if self.token_attention_mask_enabled:
+            logging.info(
+                "Context/transcript attention masking enabled: "
+                f"token_probability={self.token_attention_mask_probability}"
+            )
+        if self.ctc_insertion_enabled:
+            logging.info(
+                "CTC-derived insertion recovery enabled: "
+                f"sample_probability={self.ctc_insertion_sample_probability}, "
+                f"text_bucket_size={self.token_augmentation_text_bucket_size}"
+            )
         # Fill the -1 num_classes placeholders for the dedicated simple projections.
         for proj_name in ('simple_am_proj', 'simple_lm_proj'):
             if proj_name in self.cfg and self.cfg[proj_name].get('num_classes', -1) < 1:
@@ -201,6 +282,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             bucket_by=config.get('bucket_by', 'audio'),
             drop_last=config.get('drop_last', True),
             text_bucket_size=config.get('text_bucket_size', None),
+            max_context_tokens=config.get('max_context_tokens', None),
             augmentation=config.get('augmentation', None),
         )
         if dataset is None:
@@ -313,6 +395,31 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         context, target, attn_mask, target_start, target_end, waveform, language_ids = batch
 
+        decoder_context = context
+        decoder_attn_mask = (decoder_context != self.blank_id).long()
+        decoder_attn_mask[:, 0] = 1
+        attention_masked_tokens = context.new_zeros(())
+        attention_mask_eligible = context.new_zeros(())
+        if self.token_attention_mask_enabled:
+            (
+                decoder_attn_mask,
+                attention_masked_tokens,
+                attention_mask_eligible,
+            ) = mask_token_attention(
+                attention_mask=decoder_attn_mask,
+                token_end=target_end,
+                probability=self.token_attention_mask_probability,
+            )
+        ctc_input_selected = context.new_zeros(())
+        ctc_input_changed = context.new_zeros(())
+        ctc_input_disagreements = context.new_zeros(())
+        ctc_input_eligible = context.new_zeros(())
+        ctc_input_alignment_failures = context.new_zeros(())
+        decoder_output_indices = None
+        insertion_selected_samples = context.new_zeros(())
+        insertion_candidate_tokens = context.new_zeros(())
+        insertion_applied_samples = context.new_zeros(())
+
         # Do not pass length to the preprocessor, it will be computed in the preprocessor (padding as blank training)
         signal, signal_length = self.preprocessor(raw_speech=waveform, length=None)
         if self.spec_augmentation is not None and self.training:
@@ -323,17 +430,73 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         # simple_am for the smoothed RNN-T loss now comes from its own projection.
         simple_am = self.simple_am_proj(encoded, return_logits=True, return_softmax=False)
-        if self.ctc_loss_weight > 0:
+        if (
+            self.ctc_loss_weight > 0
+            or self.ctc_as_input_enabled
+            or self.ctc_insertion_enabled
+        ):
             ctc_output = self.ctc_decoder(encoded, return_logits=False, return_softmax=True)
 
-        # do not include the last token in the context for the decoder (this model does not predict eos token)
+        if self.ctc_as_input_enabled and self.ctc_as_input_ratio > 0.0:
+            (
+                decoder_context,
+                ctc_input_selected,
+                ctc_input_changed,
+                ctc_input_disagreements,
+                ctc_input_eligible,
+                ctc_input_alignment_failures,
+            ) = ctc_aligned_token_substitution(
+                input_ids=decoder_context,
+                target_start=target_start,
+                target_end=target_end,
+                targets=target,
+                ctc_log_probs=ctc_output.detach(),
+                input_lengths=encoded_len,
+                blank_id=self.blank_id,
+                probability=self.ctc_as_input_ratio,
+            )
+            decoder_attn_mask = (decoder_context != self.blank_id).long()
+            decoder_attn_mask[:, 0] = 1
+        elif self.ctc_insertion_enabled:
+            (
+                decoder_context,
+                decoder_attn_mask,
+                decoder_output_indices,
+                insertion_selected_samples,
+                insertion_candidate_tokens,
+                insertion_applied_samples,
+            ) = ctc_insertion_recovery(
+                input_ids=decoder_context,
+                target_start=target_start,
+                target_end=target_end,
+                targets=target,
+                ctc_log_probs=ctc_output.detach(),
+                input_lengths=encoded_len,
+                blank_id=self.blank_id,
+                pad_token_id=self.blank_id,
+                sample_probability=self.ctc_insertion_sample_probability,
+                text_bucket_size=self.token_augmentation_text_bucket_size,
+                protected_ids=self._token_augmentation_protected_ids,
+            )
+
+        # Transcript targets remain clean. CTC substitution, attention masking,
+        # and insertion recovery perturb only the prediction-network input.
         # Decoder forward. When the aux LLM loss is on, also fetch the native Qwen
         # lm_head logits (one fused forward); otherwise skip the lm_head entirely.
         if self.llm_loss is not None:
-            decoded, lm_logits, _ = self.decoder(input_ids=context, attn_mask=attn_mask, return_lm_logits=True)
+            decoded, lm_logits, _ = self.decoder(
+                input_ids=decoder_context,
+                attn_mask=decoder_attn_mask,
+                return_lm_logits=True,
+                output_indices=decoder_output_indices,
+            )
             lm_output = torch.log_softmax(lm_logits, dim=-1)   # log-probs for NLLLoss
         else:
-            decoded, _ = self.decoder(input_ids=context, attn_mask=attn_mask)
+            decoded, _ = self.decoder(
+                input_ids=decoder_context,
+                attn_mask=decoder_attn_mask,
+                output_indices=decoder_output_indices,
+            )
         # simple_lm (for the k2 smoothed loss) from its own dedicated projection.
         simple_lm = self.simple_lm_proj(decoded, return_logits=True, return_softmax=False)
 
@@ -354,7 +517,12 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         if self.llm_loss is not None:
             _, _, v = simple_lm.size()
             # We do not predict the eos token, so we does not need the last output token 
-            llm_loss = self.llm_loss(lm_output[:, :-1].reshape(-1, v), context[..., 1:].reshape(-1), target_start, target_end)
+            llm_loss = self.llm_loss(
+                lm_output[:, :-1].reshape(-1, v),
+                context[..., 1:].reshape(-1),
+                target_start,
+                target_end,
+            )
         else:
             llm_loss = 0
 
@@ -408,6 +576,39 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'global_step': self.trainer.global_step,
         }
+        if self.token_attention_mask_enabled:
+            tensorboard_logs.update({
+                "train_attention_masked_tokens": attention_masked_tokens.detach(),
+                "train_attention_masked_rate": (
+                    attention_masked_tokens.float()
+                    / attention_mask_eligible.clamp(min=1)
+                ).detach(),
+            })
+        if self.ctc_as_input_enabled:
+            tensorboard_logs.update({
+                "train_ctc_input_selected_tokens": ctc_input_selected.detach(),
+                "train_ctc_input_selected_rate": (
+                    ctc_input_selected.float() / ctc_input_eligible.clamp(min=1)
+                ).detach(),
+                "train_ctc_input_changed_tokens": ctc_input_changed.detach(),
+                "train_ctc_input_changed_rate": (
+                    ctc_input_changed.float() / ctc_input_eligible.clamp(min=1)
+                ).detach(),
+                "train_ctc_input_disagreement_rate": (
+                    ctc_input_disagreements.float() / ctc_input_eligible.clamp(min=1)
+                ).detach(),
+                "train_ctc_input_alignment_failures": ctc_input_alignment_failures.detach(),
+            })
+        if self.ctc_insertion_enabled:
+            tensorboard_logs.update({
+                "train_insertion_selected_samples": insertion_selected_samples.detach(),
+                "train_insertion_candidate_tokens": insertion_candidate_tokens.detach(),
+                "train_insertion_applied_samples": insertion_applied_samples.detach(),
+                "train_insertion_applied_rate": (
+                    insertion_applied_samples.float()
+                    / insertion_selected_samples.clamp(min=1)
+                ).detach(),
+            })
         if self.llm_loss is not None:
             tensorboard_logs.update({'train_llm_loss': llm_loss.detach()})
 

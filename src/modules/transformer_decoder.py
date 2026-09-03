@@ -31,7 +31,16 @@ class LLMDecoder(nn.Module):
                 if '.mlp.' in name:
                     param.requires_grad = False
 
-    def forward(self, input_ids, position_ids=None, attn_mask=None, cache=None, cache_position=None, return_lm_logits=False):
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        attn_mask=None,
+        cache=None,
+        cache_position=None,
+        return_lm_logits=False,
+        output_indices=None,
+    ):
         output = self.prediction.model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -42,6 +51,12 @@ class LLMDecoder(nn.Module):
         )
 
         h = output.last_hidden_state          # (B, U, D)
+        if output_indices is not None:
+            if output_indices.ndim != 2 or output_indices.shape[0] != h.shape[0]:
+                raise ValueError("output_indices must have shape [batch, output_time]")
+            h = h.gather(
+                1, output_indices.unsqueeze(-1).expand(-1, -1, h.shape[-1])
+            )
         states = output.past_key_values
         g = h.transpose(1, 2)                 # (B, D, U)
         if return_lm_logits:
