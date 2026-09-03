@@ -1,5 +1,6 @@
 <|NO_LANGUAGE_ID|>
 <|EN|>
+<|HAK|>
 <|ID|>
 <|JA|>
 <|KO|>
