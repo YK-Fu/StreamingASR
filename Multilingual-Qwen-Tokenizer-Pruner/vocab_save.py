@@ -137,40 +137,34 @@ def get_new_vocab_and_map(old_bytes_list, old_vocab_size, vocab_counts, recur_co
         only_essential_special_tokens: If True, only add BOS, EOS, PAD tokens.
                                        If False, add all special tokens from original.
     """
+    essential_token_ids = set()
+    if only_essential_special_tokens and old_tokenizer is not None:
+        if getattr(old_tokenizer, 'bos_token_id', None) is not None:
+            essential_token_ids.add(old_tokenizer.bos_token_id)
+            print(f"Adding BOS token: id={old_tokenizer.bos_token_id}")
+        if getattr(old_tokenizer, 'eos_token_id', None) is not None:
+            essential_token_ids.add(old_tokenizer.eos_token_id)
+            print(f"Adding EOS token: id={old_tokenizer.eos_token_id}")
+        if getattr(old_tokenizer, 'pad_token_id', None) is not None:
+            essential_token_ids.add(old_tokenizer.pad_token_id)
+            print(f"Adding PAD token: id={old_tokenizer.pad_token_id}")
+
     new_bytes_list = []
     mapping_new2old = []
 
     for i in tqdm(range(len(old_bytes_list)), desc="Building new vocabulary"):
-        if vocab_counts[i] + recur_counts[i] > 0:
+        # HF AddedToken IDs must follow the complete dense model/BPE vocabulary.
+        if i not in essential_token_ids and vocab_counts[i] + recur_counts[i] > 0:
             new_bytes_list.append(old_bytes_list[i])
             mapping_new2old.append(i)
 
-    # Add special token mapping
     if only_essential_special_tokens and old_tokenizer is not None:
-        # Only add BOS, EOS, PAD tokens
-        essential_token_ids = set()
-        
-        if hasattr(old_tokenizer, 'bos_token_id') and old_tokenizer.bos_token_id is not None:
-            essential_token_ids.add(old_tokenizer.bos_token_id)
-            print(f"Adding BOS token: id={old_tokenizer.bos_token_id}")
-        
-        if hasattr(old_tokenizer, 'eos_token_id') and old_tokenizer.eos_token_id is not None:
-            essential_token_ids.add(old_tokenizer.eos_token_id)
-            print(f"Adding EOS token: id={old_tokenizer.eos_token_id}")
-        
-        if hasattr(old_tokenizer, 'pad_token_id') and old_tokenizer.pad_token_id is not None:
-            essential_token_ids.add(old_tokenizer.pad_token_id)
-            print(f"Adding PAD token: id={old_tokenizer.pad_token_id}")
-        
-        # Add only essential special tokens that aren't already in mapping
-        added_special = 0
+        # Retained source specials form the mapping suffix. Model construction
+        # inserts all native BPE rows before this suffix.
         for token_id in sorted(essential_token_ids):
-            if token_id not in mapping_new2old:
-                mapping_new2old.append(token_id)
-                added_special += 1
-                print(f"  Added special token id={token_id} at new_id={len(mapping_new2old)-1}")
-        
-        print(f"Added {added_special} essential special tokens (BOS/EOS/PAD)")
+            mapping_new2old.append(token_id)
+            print(f"  Retained special token id={token_id} for tail placement")
+        print(f"Retained {len(essential_token_ids)} essential special tokens (BOS/EOS/PAD)")
     else:
         # Add all special tokens (original behavior)
         num_special = old_vocab_size - len(old_bytes_list)
@@ -233,8 +227,16 @@ def save_vocab(bytes_list, token_mapping, output_path, tokenizer_format='tiktoke
                                extra_special_tokens=extra_special_tokens,
                                native_tokens=native_tokens, native_merges=native_merges)
 
-    # Save mapping index
-    torch.save(torch.LongTensor(token_mapping), token_mapping_path)
+    # Row-aligned new->old mapping. Newly created rows have no source ID (-1),
+    # and retained source specials follow every model/BPE row.
+    num_mapped_bpe = len(bytes_list)
+    row_mapping = (
+        token_mapping[:num_mapped_bpe]
+        + [-1] * len(native_tokens)
+        + token_mapping[num_mapped_bpe:]
+        + [-1] * len(extra_special_tokens)
+    )
+    torch.save(torch.LongTensor(row_mapping), token_mapping_path)
     print(f"Mapping file (new -> old token) saved: {token_mapping_path}")
 
 
@@ -331,7 +333,7 @@ def _update_tokenizer_json(output_path, new_vocab, token_mapping, old_tokenizer,
     Args:
         extra_special_tokens: List of new special token strings to add (as added tokens).
         native_tokens: List of new NON-special BPE token strings (merged CJK chars +
-            intermediates), added to model.vocab after the special-token id range.
+            intermediates), added before the tail special-token range.
         native_merges: List of [a_str, b_str] merges appended (lowest priority) so the
             byte-level BPE rebuilds each native token.
 
@@ -372,20 +374,30 @@ def _update_tokenizer_json(output_path, new_vocab, token_mapping, old_tokenizer,
         if hasattr(old_tokenizer, 'pad_token_id') and old_tokenizer.pad_token_id is not None:
             essential_special_tokens[old_tokenizer.pad_token_id] = old_tokenizer.pad_token
     
-    # Build new vocabulary for tokenizer.json using token_mapping
-    # token_mapping[new_id] = old_id
+    # token_mapping is [mapped BPE old IDs][retained special old IDs]. new_vocab
+    # contains exactly the mapped-BPE prefix. Build a dense model vocabulary first.
+    num_mapped_bpe = len(new_vocab)
+    assert len(token_mapping) >= num_mapped_bpe
     pruned_vocab = {}
     special_token_new_ids = {}  # token_content -> new_id
-    
-    for new_id, old_id in enumerate(token_mapping):
-        if old_id in old_id_to_token:
-            # Regular BPE token
-            old_token_str = old_id_to_token[old_id]
-            pruned_vocab[old_token_str] = new_id
-        elif old_id in essential_special_tokens:
-            # Special token (BOS, EOS, PAD)
-            token_content = essential_special_tokens[old_id]
-            special_token_new_ids[token_content] = new_id
+
+    for new_id, old_id in enumerate(token_mapping[:num_mapped_bpe]):
+        if old_id not in old_id_to_token:
+            raise ValueError(f"Mapped BPE token id {old_id} is missing from source model.vocab")
+        pruned_vocab[old_id_to_token[old_id]] = new_id
+
+    # Native merged-character tokens are model/BPE tokens, so they complete the
+    # dense model vocabulary before any AddedToken IDs are assigned.
+    native_base_id = len(pruned_vocab)
+    for i, token_str in enumerate(native_tokens):
+        pruned_vocab[token_str] = native_base_id + i
+
+    special_base_id = len(pruned_vocab)
+    retained_special_ids = token_mapping[num_mapped_bpe:]
+    for i, old_id in enumerate(retained_special_ids):
+        if old_id not in essential_special_tokens:
+            raise ValueError(f"Mapped tail token id {old_id} is not an essential special token")
+        special_token_new_ids[essential_special_tokens[old_id]] = special_base_id + i
     
     # Update the vocabulary in tokenizer.json
     tokenizer_data['model']['vocab'] = pruned_vocab
@@ -412,24 +424,25 @@ def _update_tokenizer_json(output_path, new_vocab, token_mapping, old_tokenizer,
         tokenizer_data['model']['merges'] = new_merges
         print(f"Updated merges: {len(old_merges)} -> {len(new_merges)}")
     
-    # Update added_tokens - keep BOS/EOS/PAD and add extra special tokens
+    # Preserve source AddedToken metadata but replace IDs with the tail layout.
+    token_templates = {
+        info.get('content', ''): info for info in tokenizer_data.get('added_tokens', [])
+    }
     new_added_tokens = []
-    if 'added_tokens' in tokenizer_data:
-        essential_contents = set(essential_special_tokens.values())
-        
-        for token_info in tokenizer_data['added_tokens']:
-            token_content = token_info.get('content', '')
-            
-            if token_content in essential_contents:
-                if token_content in special_token_new_ids:
-                    token_info['id'] = special_token_new_ids[token_content]
-                    new_added_tokens.append(token_info)
-                elif token_content in pruned_vocab:
-                    token_info['id'] = pruned_vocab[token_content]
-                    new_added_tokens.append(token_info)
+    for token_content, new_id in special_token_new_ids.items():
+        token_info = dict(token_templates.get(token_content, {}))
+        token_info.update({
+            "id": new_id,
+            "content": token_content,
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        })
+        new_added_tokens.append(token_info)
 
-    # Append extra special tokens with IDs starting after token_mapping
-    extra_base_id = len(token_mapping)
+    extra_base_id = special_base_id + len(retained_special_ids)
     for i, token_str in enumerate(extra_special_tokens):
         new_id = extra_base_id + i
         special_token_new_ids[token_str] = new_id
@@ -445,12 +458,6 @@ def _update_tokenizer_json(output_path, new_vocab, token_mapping, old_tokenizer,
 
     tokenizer_data['added_tokens'] = new_added_tokens
 
-    # Append NATIVE merged-char tokens to the BPE vocab (real entries, not added
-    # tokens), with ids after the special-token range, plus their merge rules at
-    # lowest priority so the byte-level BPE rebuilds each one.
-    native_base_id = extra_base_id + len(extra_special_tokens)
-    for i, token_str in enumerate(native_tokens):
-        pruned_vocab[token_str] = native_base_id + i
     tokenizer_data['model']['vocab'] = pruned_vocab
 
     if native_merges:
@@ -463,9 +470,22 @@ def _update_tokenizer_json(output_path, new_vocab, token_mapping, old_tokenizer,
     print(f"Updated added_tokens: {len(new_added_tokens)} ({len(extra_special_tokens)} extra special)")
     print(f"Appended {len(native_tokens)} native merged-char tokens + {len(native_merges)} merges")
 
+    if sorted(pruned_vocab.values()) != list(range(len(pruned_vocab))):
+        raise ValueError("model.vocab IDs are not a dense prefix")
+    added_ids = [tok['id'] for tok in new_added_tokens]
+    expected_added_ids = list(range(len(pruned_vocab), len(pruned_vocab) + len(new_added_tokens)))
+    if added_ids != expected_added_ids:
+        raise ValueError("added special-token IDs are not a contiguous tail")
+
     # Save updated tokenizer.json
     with open(tokenizer_json_path, 'w', encoding='utf-8') as f:
         json.dump(tokenizer_data, f, ensure_ascii=False, indent=2)
+
+    # Qwen2Tokenizer (slow) reads vocab.json rather than tokenizer.json. Keep it
+    # identical to the final model vocabulary, including native merged-char rows.
+    vocab_json_path = os.path.join(output_path, 'vocab.json')
+    with open(vocab_json_path, 'w', encoding='utf-8') as f:
+        json.dump(pruned_vocab, f, ensure_ascii=False, indent=2)
 
     total_vocab_size = len(pruned_vocab) + len(special_token_new_ids)
     print(f"Updated tokenizer.json: vocabulary size {len(old_vocab)} -> "

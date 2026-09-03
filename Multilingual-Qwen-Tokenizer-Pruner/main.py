@@ -66,6 +66,35 @@ def select_per_language_keep(per_lang_counts, alive_mask, max_size):
     return keep, info
 
 
+def build_vocab_padding_tokens(vocab_size, multiple, existing_tokens=()):
+    """Return reserved special tokens that pad ``vocab_size`` to ``multiple``.
+
+    Padding tokens are appended at the very end of the tokenizer so all real
+    token IDs remain unchanged. Names are chosen deterministically while
+    avoiding collisions with source and user-provided special tokens.
+    """
+    if vocab_size <= 0:
+        raise ValueError(f"vocab_size must be positive, got {vocab_size}")
+    if multiple <= 0:
+        raise ValueError(f"pad_vocab_multiple must be positive, got {multiple}")
+
+    padding_count = (-vocab_size) % multiple
+    if padding_count == 0:
+        return []
+
+    used = set(existing_tokens)
+    padding_tokens = []
+    candidate_idx = 0
+    while len(padding_tokens) < padding_count:
+        token = f"<|vocab_padding_{candidate_idx:03d}|>"
+        candidate_idx += 1
+        if token in used:
+            continue
+        used.add(token)
+        padding_tokens.append(token)
+    return padding_tokens
+
+
 def prepare_native_char_tokens(chars, old_tokenizer, internals, vocab_counts, recur_counts):
     """Guarantee every char in `chars` is a single *native BPE* token in the pruned model.
 
@@ -152,12 +181,16 @@ def main():
                         help='Path to directory containing JSONL files for counting')
     parser.add_argument('--inherit_vocab_count', type=str, default=None,
                         help='Path to existing vocab_counts.torch to inherit from')
+    parser.add_argument('--inherit_per_lang_counts', type=str, default=None,
+                        help='Path to an existing per_lang_counts.npz for --per_lang_target_size. '
+                             'Allows per-language pruning without --support_data.')
     parser.add_argument('--target_size', type=int, default=None,
                         help='Global target vocabulary size (optional)')
     parser.add_argument('--per_lang_target_size', type=int, default=None,
                         help='Maximum vocab size PER LANGUAGE (instead of a global --target_size). '
                              'Each language keeps at most this many of its most frequent tokens; '
-                             'the kept sets are unioned. Requires --support_data. CJK char / byte / '
+                             'the kept sets are unioned. Requires --support_data or '
+                             '--inherit_per_lang_counts. CJK char / byte / '
                              'special tokens are kept on top of this budget.')
     parser.add_argument('--filter_rare_percentile', type=float, default=None,
                         help='Zero out bottom X%% of tokens per file (e.g., 5 for 5%%)')
@@ -175,7 +208,12 @@ def main():
                              'single native BPE token (merging sub-tokens with averaged embeddings).')
     parser.add_argument('--add_special_tokens', type=str, default=None,
                         help='Path to text file with new special tokens to add (one per line)')
+    parser.add_argument('--pad_vocab_multiple', type=int, default=None,
+                        help='Append reserved special tokens until the final tokenizer/model '
+                             'vocabulary is divisible by this value (for example: 64).')
     args = parser.parse_args()
+    if args.pad_vocab_multiple is not None and args.pad_vocab_multiple <= 0:
+        parser.error('--pad_vocab_multiple must be positive')
     
     # Validate: need at least one source of vocabulary counts
     has_data_source = (args.support_data is not None) or (args.inherit_vocab_count is not None)
@@ -259,12 +297,36 @@ def main():
     # (by that language's own counts) + their merge closures, instead of a global cut.
     internals = load_tokenizer_internals(args.old_model_path)
     if args.per_lang_target_size is not None:
-        if args.support_data is None:
-            raise ValueError("--per_lang_target_size requires --support_data (per-language counts)")
         if args.target_size is not None:
             raise ValueError("Use either --target_size or --per_lang_target_size, not both")
+        if args.support_data is not None:
+            per_lang_counts_path = os.path.join(args.new_model_path, 'per_lang_counts.npz')
+        elif args.inherit_per_lang_counts is not None:
+            per_lang_counts_path = args.inherit_per_lang_counts
+        else:
+            raise ValueError(
+                "--per_lang_target_size requires --support_data or "
+                "--inherit_per_lang_counts"
+            )
+        if not os.path.isfile(per_lang_counts_path):
+            raise ValueError(f"Per-language counts file not found: {per_lang_counts_path}")
         print(f"==> Max vocab size per language: {args.per_lang_target_size:,}")
-        per_lang_counts = dict(np.load(os.path.join(args.new_model_path, 'per_lang_counts.npz')))
+        print(f"==> Loading per-language counts from: {per_lang_counts_path}")
+        with np.load(per_lang_counts_path) as loaded_per_lang_counts:
+            per_lang_counts = {
+                stem: counts for stem, counts in loaded_per_lang_counts.items()
+            }
+        invalid_counts = [
+            stem for stem, counts in per_lang_counts.items()
+            if counts.ndim != 1 or len(counts) != old_vocab_size
+        ]
+        if invalid_counts:
+            raise ValueError(
+                "Each per-language count array must have one entry per original token "
+                f"({old_vocab_size}); invalid entries: {', '.join(sorted(invalid_counts))}"
+            )
+        if not per_lang_counts:
+            raise ValueError(f"No per-language counts found in: {per_lang_counts_path}")
         alive_mask = (np.array(vocab_counts, dtype=np.int64) > 0).astype(np.float64)
         keep_ids, info = select_per_language_keep(per_lang_counts, alive_mask,
                                                   args.per_lang_target_size)
@@ -308,6 +370,7 @@ def main():
         with open(args.add_special_tokens, 'r', encoding='utf-8') as f:
             extra_special_tokens = [line.strip() for line in f if line.strip()]
         print(f"==> Will add {len(extra_special_tokens)} extra special tokens from {args.add_special_tokens}")
+    num_user_extra_special = len(extra_special_tokens)
 
     # Get new vocabulary and mapping
     print(f"==> Building new vocabulary")
@@ -319,8 +382,29 @@ def main():
         old_tokenizer=old_tokenizer,
         only_essential_special_tokens=True  # Only BOS, EOS, PAD
     )
-    # Appended id layout: [mapped][extra_special][native merged-char tokens]
-    new_vocab_size = len(mapping_new2old) + len(extra_special_tokens) + len(native_token_strs)
+    # HF-compatible ID layout:
+    # [mapped BPE][native merged-char BPE][retained special][extra special]
+    # [vocab-padding special]. Padding is calculated only after every real token
+    # has been counted, so it cannot shift an existing token ID.
+    num_mapped_bpe = len(new_bytes_list)
+    unpadded_vocab_size = (
+        len(mapping_new2old) + len(extra_special_tokens) + len(native_token_strs)
+    )
+    padding_special_tokens = []
+    if args.pad_vocab_multiple is not None:
+        padding_special_tokens = build_vocab_padding_tokens(
+            unpadded_vocab_size,
+            args.pad_vocab_multiple,
+            existing_tokens=set(old_tokenizer.get_vocab()) | set(extra_special_tokens),
+        )
+        extra_special_tokens.extend(padding_special_tokens)
+        print(
+            f"==> Vocabulary alignment: {unpadded_vocab_size:,} + "
+            f"{len(padding_special_tokens)} reserved token(s) = "
+            f"{unpadded_vocab_size + len(padding_special_tokens):,} "
+            f"(multiple of {args.pad_vocab_multiple})"
+        )
+    new_vocab_size = unpadded_vocab_size + len(padding_special_tokens)
 
     # Save vocabulary files
     save_vocab(
@@ -339,18 +423,24 @@ def main():
     if 'visual' in old_model.config.__dict__:
         print(f"  Detected Qwen-VL model")
         saving_updated_qwenvl(old_model, new_vocab_size, mapping_new2old, args.new_model_path,
-                              num_extra_special=len(extra_special_tokens), merge_init=merge_init)
+                              num_extra_special=len(extra_special_tokens), merge_init=merge_init,
+                              num_mapped_bpe=num_mapped_bpe,
+                              num_padding_special=len(padding_special_tokens))
     else:
         print(f"  Detected standard Qwen model")
         saving_updated_qwen(old_model, new_vocab_size, mapping_new2old, args.new_model_path,
-                            num_extra_special=len(extra_special_tokens), merge_init=merge_init)
+                            num_extra_special=len(extra_special_tokens), merge_init=merge_init,
+                            num_mapped_bpe=num_mapped_bpe,
+                            num_padding_special=len(padding_special_tokens))
     
     print(f"\n{'='*50}")
     print(f"Vocabulary pruning complete!")
     print(f"  Original size: {old_vocab_size:,}")
     print(f"  New size:      {new_vocab_size:,}")
-    if extra_special_tokens:
-        print(f"    (includes {len(extra_special_tokens)} extra special tokens)")
+    if num_user_extra_special:
+        print(f"    (includes {num_user_extra_special} user-provided special tokens)")
+    if padding_special_tokens:
+        print(f"    (includes {len(padding_special_tokens)} vocabulary-padding tokens)")
     if native_token_strs:
         print(f"    (includes {len(native_token_strs)} native merged CJK-char tokens)")
     print(f"  Reduction:     {old_vocab_size - new_vocab_size:,} tokens ({100*(old_vocab_size-new_vocab_size)/old_vocab_size:.1f}%)")
