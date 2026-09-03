@@ -99,33 +99,32 @@ class RNNTInfer:
         device = next(self.prediction_network.parameters()).device
         dtype = next(self.prediction_network.parameters()).dtype
         if input_ids is None:
-            # No transcribed history, begin with BOS
+            # No transcribed history: prefill only BOS. The StaticCache reserves
+            # max_length slots, but the model should not execute 1024 padded
+            # prompt positions just to initialize that cache.
             assert batch_size is not None, "batch_size must be provided if input_ids is None"
-            input_ids = torch.zeros(batch_size, self.max_length, device=device, dtype=torch.long).fill_(self.bos_idx)
-            attn_mask = torch.zeros(batch_size, self.max_length, device=device, dtype=torch.int32)
-            attn_mask[:, 0] = 1
-            position_ids = torch.zeros(batch_size, self.max_length, device=device, dtype=torch.long)
+            input_ids = torch.full((batch_size, 1), self.bos_idx, device=device, dtype=torch.long)
+            attn_mask = torch.ones((batch_size, 1), device=device, dtype=torch.int32)
+            position_ids = torch.zeros((batch_size, 1), device=device, dtype=torch.long)
         else:
             assert batch_size is None or batch_size == input_ids.size(0), "batch_size and input_ids.size(0) must be the same or batch_size is None"
             input_ids = input_ids.to(device)
+            assert input_ids.size(1) <= self.max_length, "prompt length must not exceed max_length"
             # The prompt passed by the WER path ([bos, <language>, ...]) is
             # unpadded, so all tokens are valid and positions are contiguous.
-            # Build the mask / positions here when the caller omits them.
             if attn_mask is None:
                 attn_mask = torch.ones_like(input_ids, dtype=torch.int32)
             if position_ids is None:
                 position_ids = torch.arange(input_ids.size(1), device=device, dtype=torch.long).unsqueeze(0).expand(input_ids.size(0), -1).contiguous()
             attn_mask = attn_mask.to(device)
             position_ids = position_ids.to(device)
-            if input_ids.size(1) != self.max_length:
-                assert input_ids.size(1) < self.max_length, "input_ids.size(1) must be less than max_length - 1"
-                input_ids = F.pad(input_ids, (0, self.max_length - input_ids.size(1)), value=self.bos_idx)
-                attn_mask = F.pad(attn_mask, (0, self.max_length - attn_mask.size(1)), value=0)
-                position_ids = F.pad(position_ids, (0, self.max_length - position_ids.size(1)), value=0)
-            else:
-                assert attn_mask.size(1) == position_ids.size(1) == self.max_length, "attn_mask.size(1) must be equal to max_length - 1 if input_ids.size(1) is equal to max_length - 1"
+            assert attn_mask.shape == input_ids.shape
+            assert position_ids.shape == input_ids.shape
+
+        batch_size = input_ids.size(0)
         valid_lengths = attn_mask.sum(dim=-1)
-        cache_position = torch.arange(self.max_length, device=device, dtype=torch.int64)
+        prompt_length = input_ids.size(1)
+        cache_position = torch.arange(prompt_length, device=device, dtype=torch.int64)
         cache = StaticCache(
             config=self.prediction_network.config,
             max_batch_size=batch_size,
@@ -144,7 +143,9 @@ class RNNTInfer:
         # token's hidden state, i.e. index valid_lengths - 1 (not valid_lengths,
         # which is the first padding slot).
         next_token_logits = outputs.transpose(1, 2)[torch.arange(batch_size), valid_lengths - 1].unsqueeze(1)
-        next_attn_mask = F.pad(attn_mask, (0, 1), value=1)      # (b, max_length) -> (b, max_length + 1)
+        # Grow this mask one column only when a non-blank token is
+        # emitted. Its width then tracks the number of populated cache slots.
+        next_attn_mask = attn_mask
         # position_ids / cache_position follow the SAME "last consumed token"
         # convention: both index valid_lengths - 1. The decode loop increments
         # them by 1 (in the emit block) before the next forward, so the first
@@ -158,8 +159,11 @@ class RNNTInfer:
         # valid_lengths are equal (the default BOS-only start satisfies this).
         next_cache_position = valid_lengths.max().unsqueeze(0) - 1
 
-        # The content of input_ids will not be used again, we return it as the placeholder for the one step decode stage
-        return input_ids[:, :1], next_token_logits, next_attn_mask, next_position_ids, cache, next_cache_position
+        # Greedy decoding overwrites this one-token placeholder in-place. Clone it:
+        # prompt input_ids can be a view into the training context, which compiled
+        # embedding backward still needs unchanged at periodic training-WER steps.
+        next_input_ids = input_ids[:, :1].clone()
+        return next_input_ids, next_token_logits, next_attn_mask, next_position_ids, cache, next_cache_position
 
 
     def forward_decoder_one_step(self, input_ids, attn_mask, position_ids, cache, cache_position, decoder_logits=None):
@@ -224,6 +228,9 @@ class LoopLabelRNNTInfer(RNNTInfer):
                 find_next_token_or_end = ~b2active | ~blank_mask
 
             if not blank_mask.all():
+                # The emitted token is consumed by the decoder on the next
+                # forward at cache_position + 1.
+                attn_mask = F.pad(attn_mask, (0, 1), value=0)
                 for b in range(batch_size):
                     if predictions[b] != self.blank_idx:
                         input_ids[b, 0] = predictions[b]
@@ -273,15 +280,14 @@ class LoopFrameRNNTInfer(RNNTInfer):
                 if blank_mask.all():
                     break
                 else:
+                    attn_mask = F.pad(attn_mask, (0, 1), value=0)
                     for b in range(batch_size):
                         if predictions[b] != self.blank_idx:
                             input_ids[b, 0] = predictions[b]
-                            attn_mask[b, cache_position] = 1
+                            attn_mask[b, cache_position + 1] = 1
                             position_ids[b, 0] = position_ids[b, 0] + 1
                             symbols_added[b] += 1
                             hyps[b].y_sequence.append(predictions[b].item())
-                        else:
-                            attn_mask[b, cache_position] = 0
                 dec_out = None
                 cache_position = cache_position + 1
         return hyps, input_ids, attn_mask, position_ids, cache, cache_position
@@ -318,6 +324,7 @@ class RNNTDecoding(ConfidenceMethodMixin):
             self.decoding = LoopLabelRNNTInfer(
                 prediction_network=decoder,
                 joint_network=joint,
+                bos_idx=self.blank_id,
                 blank_idx=self.blank_id,
                 max_length=self.max_length,
                 max_symbols_per_step=self.max_symbols_per_step,
@@ -329,6 +336,7 @@ class RNNTDecoding(ConfidenceMethodMixin):
             self.decoding = LoopFrameRNNTInfer(
                 prediction_network=decoder,
                 joint_network=joint,
+                bos_idx=self.blank_id,
                 blank_idx=self.blank_id,
                 max_length=self.max_length,
                 max_symbols_per_step=self.max_symbols_per_step,
