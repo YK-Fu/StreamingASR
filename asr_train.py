@@ -19,6 +19,7 @@ register_optimizer("adamw_8bit", bnb.optim.AdamW8bit, AdamWParams)
 
 from src.models.rnnt_model import HybridRNNTCTCWhisperLMModel
 
+
 @hydra_runner(config_path="./conf", config_name="hybrid_transducer_ctc")
 def main(cfg):
     logging.info(f'Hydra config: {OmegaConf.to_yaml(cfg)}')
@@ -59,7 +60,7 @@ def main(cfg):
             asr_model.encoder, dynamic=True, fullgraph=False
         )
         asr_model.decoder = torch.compile(
-            asr_model.decoder, dynamic=False, fullgraph=True
+            asr_model.decoder, dynamic=False, fullgraph=False
         )
         asr_model.ctc_decoder = torch.compile(
             asr_model.ctc_decoder, dynamic=True, fullgraph=False
