@@ -8,7 +8,32 @@ model:
   log_prediction: true # enables logging sample predictions in the output during training
   skip_nan_grad: true
   use_cer: true
-
+  validation_names:
+  - zh_tw
+  - zh_cn
+  - ja
+  - ko
+  - en
+  - 'nan'
+  - hak
+  - th
+  - yue
+  - vi
+  - id
+  - ru
+  validation_use_cer:
+  - true
+  - true
+  - true
+  - true
+  - false
+  - true
+  - true
+  - true
+  - true
+  - false
+  - false
+  - false
   model_defaults:
     enc_hidden: ${model.encoder.d_model}
     pred_hidden: ${model.decoder.config.hidden_size}

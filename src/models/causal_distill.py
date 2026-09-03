@@ -339,21 +339,46 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             super().on_validation_epoch_end()
             return
 
+        def globally_reduced_rate(numerator, denominator):
+            counts = torch.stack(
+                [numerator.detach().to(torch.float64), denominator.detach().to(torch.float64)]
+            )
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+            return counts[0] / counts[1] if counts[1] > 0 else counts.new_zeros(())
+
         if isinstance(outputs[0], list):
-            # Per-dataloader val_wer_ctc for wandb
+            validation_names = list(self.cfg.get('validation_names', []))
+            validation_use_cer = list(self.cfg.get('validation_use_cer', []))
+            ctc_error_rates = []
             for i, dl_outputs in enumerate(outputs):
                 if dl_outputs:
-                    dl_wer = sum(o['val_wer_ctc'] for o in dl_outputs) / len(dl_outputs)
-                    self.log(f'val_wer_ctc_dl{i}', dl_wer, sync_dist=True)
+                    dl_num = sum(o['val_wer_num_ctc'] for o in dl_outputs)
+                    dl_denom = sum(o['val_wer_denom_ctc'] for o in dl_outputs)
+                    dl_rate = globally_reduced_rate(dl_num, dl_denom)
+                    ctc_error_rates.append(dl_rate)
+                    self.log(f'val_wer_ctc_dl{i}', dl_rate, sync_dist=False)
+                    if i < len(validation_names) and i < len(validation_use_cer):
+                        metric = 'cer' if validation_use_cer[i] else 'wer'
+                        name = validation_names[i]
+                        self.log(f'val_{metric}_{name}_ctc', dl_rate, sync_dist=False)
+            if ctc_error_rates:
+                self.log(
+                    'val_error_rate_macro_ctc',
+                    torch.stack(ctc_error_rates).mean(),
+                    sync_dist=False,
+                )
             all_outputs = [o for dl in outputs for o in dl]
         else:
             all_outputs = list(outputs)
 
         if all_outputs:
-            keys = [k for k in all_outputs[0] if k != 'val_wer_ctc']
-            # Macro avg of val_wer_ctc (bare key) for checkpoint monitor
-            self.log('val_wer_ctc', sum(o['val_wer_ctc'] for o in all_outputs) / len(all_outputs), sync_dist=True)
-            # Macro avg of all other metrics (no suffix), sit alongside training logs in wandb
+            total_num = sum(o['val_wer_num_ctc'] for o in all_outputs)
+            total_denom = sum(o['val_wer_denom_ctc'] for o in all_outputs)
+            total_rate = globally_reduced_rate(total_num, total_denom)
+            self.log('val_wer_ctc', total_rate, sync_dist=False)
+            skip = {'val_wer_ctc', 'val_wer_num_ctc', 'val_wer_denom_ctc'}
+            keys = [k for k in all_outputs[0] if k not in skip]
             for key in keys:
                 self.log(key, sum(o[key] for o in all_outputs) / len(all_outputs), sync_dist=True)
 
@@ -361,6 +386,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         torch.cuda.empty_cache()
         gc.collect()
         super().on_validation_epoch_end()
+        self.ctc_wer.use_cer = self.cfg.aux_ctc.get('use_cer', False)
 
     def on_train_epoch_end(self):
         torch.cuda.empty_cache()
@@ -388,6 +414,15 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
 
     @torch.no_grad()
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
+        validation_use_cer = self.cfg.get('validation_use_cer', None)
+        if validation_use_cer is not None:
+            if dataloader_idx >= len(validation_use_cer):
+                raise ValueError(
+                    f"Missing validation_use_cer entry for dataloader_idx={dataloader_idx}; "
+                    f"configured entries={len(validation_use_cer)}"
+                )
+            self.ctc_wer.use_cer = bool(validation_use_cer[dataloader_idx])
+
         _, target, _, target_start, target_end, waveform, language_ids = batch
         target_len = target_end - target_start
         signal, _ = self.preprocessor(raw_speech=waveform, length=None)

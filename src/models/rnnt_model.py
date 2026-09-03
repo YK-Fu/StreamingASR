@@ -463,6 +463,20 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
     @torch.no_grad()
     def validation_pass(self, batch, batch_idx, dataloader_idx=0):
+        validation_use_cer = self.cfg.get('validation_use_cer', None)
+        if validation_use_cer is not None:
+            if dataloader_idx >= len(validation_use_cer):
+                raise ValueError(
+                    f"Missing validation_use_cer entry for dataloader_idx={dataloader_idx}; "
+                    f"configured entries={len(validation_use_cer)}"
+                )
+            use_cer = bool(validation_use_cer[dataloader_idx])
+            # The validation dataloaders run sequentially, so the existing RNNT
+            # and CTC metric objects can share their already-computed decodes while
+            # selecting CER for CJK and WER for English per dataloader.
+            self.wer.use_cer = use_cer
+            self.ctc_wer.use_cer = use_cer
+
         context, target, attn_mask, target_start, target_end, signal, language_ids = batch
         signal, _ = self.preprocessor(raw_speech=signal, length=None)
         encoded = self.forward(input_signal=signal, language_ids=language_ids)
@@ -558,6 +572,10 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         if isinstance(outputs[0], list):
             # Per-dataloader WER for wandb
+            validation_names = list(self.cfg.get('validation_names', []))
+            validation_use_cer = list(self.cfg.get('validation_use_cer', []))
+            rnnt_error_rates = []
+            ctc_error_rates = []
             for i, dl_outputs in enumerate(outputs):
                 if not dl_outputs:
                     continue
@@ -565,8 +583,22 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                 dl_wer_denom = sum(o['val_wer_denom'] for o in dl_outputs)
                 dl_ctc_num = sum(o['val_wer_num_ctc'] for o in dl_outputs)
                 dl_ctc_denom = sum(o['val_wer_denom_ctc'] for o in dl_outputs)
-                self.log(f'val_wer_dl{i}', dl_wer_num / dl_wer_denom if dl_wer_denom > 0 else 0.0, sync_dist=True)
-                self.log(f'val_wer_ctc_dl{i}', dl_ctc_num / dl_ctc_denom if dl_ctc_denom > 0 else 0.0, sync_dist=True)
+                rnnt_rate = dl_wer_num / dl_wer_denom if dl_wer_denom > 0 else dl_wer_num.new_zeros(())
+                ctc_rate = dl_ctc_num / dl_ctc_denom if dl_ctc_denom > 0 else dl_ctc_num.new_zeros(())
+                rnnt_error_rates.append(rnnt_rate)
+                ctc_error_rates.append(ctc_rate)
+                self.log(f'val_wer_dl{i}', rnnt_rate, sync_dist=True)
+                self.log(f'val_wer_ctc_dl{i}', ctc_rate, sync_dist=True)
+
+                if i < len(validation_names) and i < len(validation_use_cer):
+                    metric = 'cer' if validation_use_cer[i] else 'wer'
+                    name = validation_names[i]
+                    self.log(f'val_{metric}_{name}', rnnt_rate, sync_dist=True)
+                    self.log(f'val_{metric}_{name}_ctc', ctc_rate, sync_dist=True)
+
+            if rnnt_error_rates:
+                self.log('val_error_rate_macro', torch.stack(rnnt_error_rates).mean(), sync_dist=True)
+                self.log('val_error_rate_macro_ctc', torch.stack(ctc_error_rates).mean(), sync_dist=True)
             all_outputs = [o for dl in outputs for o in dl]
         else:
             all_outputs = list(outputs)
@@ -591,6 +623,10 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         # sublists on next epoch (in-place clear() would leave a flat []).
         self._validation_step_outputs = None
         super().on_validation_epoch_end()
+        # Validation ends with the English dataloader (WER). Restore the default
+        # training metrics so periodic training logs retain their configured mode.
+        self.wer.use_cer = self.cfg.get('use_cer', False)
+        self.ctc_wer.use_cer = self.cfg.aux_ctc.get('use_cer', False)
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -644,7 +680,72 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
         super().on_save_checkpoint(state_dict)
 
+    def load_state_dict(self, state_dict, strict=True, **kwargs):
+        # torch.compile wraps a compiled submodule so its weights are saved under an
+        # `_orig_mod.` prefix (e.g. `ctc_decoder._orig_mod.pre.0.weight`). If the compile
+        # config CHANGED since the checkpoint was written (e.g. ctc_decoder toggled between
+        # compiled and eager via ASR_NO_COMPILE_CTC across runs), those keys no longer match
+        # the live module names and a strict load fails. Reconcile BOTH directions by mapping
+        # on the `_orig_mod.`-stripped ("canonical") key: a checkpoint key is rewritten to
+        # whatever the current model calls that same canonical param — adding `_orig_mod.`
+        # when the module is now compiled, or removing it when it is now eager. No-op when the
+        # compile config is unchanged. Done here (not on_load_checkpoint) so it is independent
+        # of Lightning hook ordering.
+        model_keys = list(super().state_dict().keys())
+        model_key_set = set(model_keys)
+        if any(k not in model_key_set for k in state_dict):
+            canon_to_model = {k.replace('._orig_mod.', '.'): k for k in model_keys}
+            reconciled = {}
+            for k, v in state_dict.items():
+                if k not in model_key_set:
+                    k = canon_to_model.get(k.replace('._orig_mod.', '.'), k)
+                reconciled[k] = v
+            state_dict = reconciled
+        return super().load_state_dict(state_dict, strict=strict, **kwargs)
+
     def on_load_checkpoint(self, state_dict):
+        # Recompute loop progress from optimizer steps using the CURRENT accumulation
+        # setting. This is required when resuming with an equivalent effective batch
+        # size but a different microbatch/accumulation split (for example 4x4 -> 8x2).
+        # Otherwise Lightning restores the old microbatch count, which can exceed the
+        # new number of batches per epoch and immediately trigger max_epochs.
+        fit_loop = state_dict.get('loops', {}).get('fit_loop', {})
+        train_dl = getattr(self, '_train_dl', None)
+        if fit_loop and train_dl is not None:
+            num_training_batches = len(train_dl)
+            if num_training_batches > 0:
+                total_batches = int(state_dict.get('global_step', 0)) * int(
+                    self.trainer.accumulate_grad_batches
+                )
+                completed_epochs, current_batch = divmod(total_batches, num_training_batches)
+
+                combined_loaders = fit_loop.get('state_dict', {}).get('combined_loader', [])
+                if combined_loaders:
+                    combined_loaders[0]['epoch'] = completed_epochs
+                    combined_loaders[0]['consumed_batches'] = total_batches
+
+                batch_progress = fit_loop.get('epoch_loop.batch_progress', {})
+                for key in ('ready', 'started', 'processed', 'completed'):
+                    batch_progress.get('total', {})[key] = total_batches
+                    batch_progress.get('current', {})[key] = current_batch
+                if batch_progress:
+                    batch_progress['is_last_batch'] = False
+
+                epoch_progress = fit_loop.get('epoch_progress', {})
+                for scope in ('total', 'current'):
+                    progress = epoch_progress.get(scope, {})
+                    progress['processed'] = completed_epochs
+                    progress['completed'] = completed_epochs
+
+                state_dict['epoch'] = completed_epochs
+                logging.info(
+                    "Normalized checkpoint loop progress for current batching: "
+                    f"global_step={state_dict.get('global_step', 0)}, "
+                    f"accumulate_grad_batches={self.trainer.accumulate_grad_batches}, "
+                    f"consumed_batches={total_batches}, epoch={completed_epochs}, "
+                    f"batch={current_batch}/{num_training_batches}"
+                )
+
         if 'rng_state' in state_dict:
             torch.set_rng_state(state_dict['rng_state']['torch'])
             torch.cuda.set_rng_state_all(state_dict['rng_state']['cuda'])

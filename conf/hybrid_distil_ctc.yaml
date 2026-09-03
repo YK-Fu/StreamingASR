@@ -9,7 +9,32 @@ model:
   log_prediction: true # enables logging sample predictions in the output during training
   skip_nan_grad: true
   use_cer: true
-
+  validation_names:
+    - zh_tw
+    - zh_cn
+    - ja
+    - ko
+    - en
+    - nan
+    - hak
+    - th
+    - yue
+    - vi
+    - id
+    - ru
+  validation_use_cer:
+    - true
+    - true
+    - true
+    - true
+    - false
+    - true
+    - true
+    - true
+    - true
+    - false
+    - false
+    - false
   model_defaults:
     enc_hidden: ${model.student.d_model}
     # Hidden dim of the two-layer CTC head. Set to match the RNN-T joint_hidden in
