@@ -196,10 +196,9 @@ class PrunedRNNTJoint(RNNTJoint):
         del inp
 
 
-        if not log_softmax:
-            res = (res / self.temperature).log_softmax(dim=-1)
-        else:
-            res = (res / self.temperature)
+        res = res / self.temperature
+        if log_softmax:
+            res = res.log_softmax(dim=-1)
 
         return res
 
