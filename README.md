@@ -106,21 +106,20 @@ Distill a pretrained Whisper model into a streaming-capable student encoder.
 #### 1.1 Convert HuggingFace Checkpoint
 
 ```bash
-cd $WORKSPACE/StreamingASR/ckpt_conversion/
+cd $WORKSPACE/StreamingASR/
 
-python convert_hf_to_nemo.py \
+python -m ckpt_conversion.convert_hf_to_nemo \
     --whisper openai/whisper-large-v2 \
-    --config ../conf/hybrid_distil_ctc.yaml \
-    --output distil.nemo \
-    --include-position-embeddings
+    --config conf/hybrid_distil_ctc.yaml \
+    --output ckpt_conversion/distil.nemo
 ```
 
 #### 1.2 (Optional) Verify Conversion
 
 ```bash
-python verify_checkpoint.py \
-    --checkpoint distil.nemo \
-    --config ../conf/hybrid_distil_ctc.yaml \
+python -m ckpt_conversion.verify_checkpoint \
+    --checkpoint ckpt_conversion/distil.nemo \
+    --config conf/hybrid_distil_ctc.yaml \
     --whisper openai/whisper-large-v2
 ```
 
@@ -145,13 +144,13 @@ To reduce VRAM usage, you can prune the Qwen tokenizer vocabulary. See [Multilin
 #### 2.2 Convert Distilled Model to RNN-T Format
 
 ```bash
-cd $WORKSPACE/StreamingASR/ckpt_conversion/
+cd $WORKSPACE/StreamingASR/
 
-python convert_distill_to_rnnt.py \
+python -m ckpt_conversion.convert_distill_to_rnnt \
     --distill-checkpoint /path/to/trained_distil.nemo \
     --qwen Qwen/Qwen2.5-0.5B \
-    --config ../conf/hybrid_transducer_ctc.yaml \
-    --output rnnt_model.nemo
+    --config conf/hybrid_transducer_ctc.yaml \
+    --output ckpt_conversion/rnnt_model.nemo
 ```
 
 #### 2.3 Run RNN-T Training
