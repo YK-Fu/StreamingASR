@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from torchmetrics import Metric
 from transformers import StaticCache
 
+from src.modules.transformer_decoder import DecoderRuntime
+
 from nemo.collections.asr.parts.utils import rnnt_utils
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, AbstractCTCDecoding
 from nemo.collections.asr.parts.utils.asr_confidence_utils import ConfidenceMethodMixin
@@ -81,23 +83,33 @@ class RNNTInfer:
         bos_idx: int = 0,
         blank_idx: int = 0,
         max_length: int = 1024,
+        prefill_bucket_size: int = 0,
         max_symbols_per_step: int = 10,  # Max symbols per encoder frame (safety)
+        max_symbols: int = 1024,  # Max emitted symbols per hypothesis
         preserve_alignments: bool = False,
         preserve_frame_confidence: bool = False,
         compute_timestamps: bool = False,
     ):
         # TODO: Add timestamp/alignments/confidence computation implementation
-        self.prediction_network = prediction_network
+        self.decoder_runtime = DecoderRuntime.eager(prediction_network)
         self.joint_network = joint_network
         self.blank_idx = blank_idx
         self.bos_idx = bos_idx
         self.max_length = max_length
+        self.prefill_bucket_size = prefill_bucket_size
         self.max_symbols_per_step = max_symbols_per_step
+        self.max_symbols = max_symbols
         self.compute_timestamps = compute_timestamps
 
+    def set_decoder_runtime(self, runtime: DecoderRuntime):
+        if runtime.base is not self.decoder_runtime.base:
+            raise ValueError("DecoderRuntime.base must be the canonical prediction network")
+        self.decoder_runtime = runtime
+
     def prefill_decoder_state(self, input_ids=None, attn_mask=None, position_ids=None, batch_size=None):
-        device = next(self.prediction_network.parameters()).device
-        dtype = next(self.prediction_network.parameters()).dtype
+        base_decoder = self.decoder_runtime.base
+        device = next(base_decoder.parameters()).device
+        dtype = next(base_decoder.parameters()).dtype
         if input_ids is None:
             # No transcribed history: prefill only BOS. The StaticCache reserves
             # max_length slots, but the model should not execute 1024 padded
@@ -124,15 +136,37 @@ class RNNTInfer:
         batch_size = input_ids.size(0)
         valid_lengths = attn_mask.sum(dim=-1)
         prompt_length = input_ids.size(1)
-        cache_position = torch.arange(prompt_length, device=device, dtype=torch.int64)
+        prefill_network = base_decoder
+        if (
+            self.decoder_runtime.decode_prefill is not None
+            and self.prefill_bucket_size > 0
+        ):
+            bucket_length = min(
+                self.max_length,
+                ((prompt_length + self.prefill_bucket_size - 1) // self.prefill_bucket_size)
+                * self.prefill_bucket_size,
+            )
+            if bucket_length < prompt_length:
+                raise ValueError("Prompt is too long for the static decoder cache")
+            pad_length = bucket_length - prompt_length
+            if pad_length:
+                input_ids = F.pad(input_ids, (0, pad_length), value=self.bos_idx)
+                attn_mask = F.pad(attn_mask, (0, pad_length), value=0)
+                # Padded positions are masked, so their logical position is not
+                # observed. Actual emitted tokens subsequently overwrite these
+                # cache slots using their contiguous logical position.
+                position_ids = F.pad(position_ids, (0, pad_length), value=0)
+            prefill_network = self.decoder_runtime.prefill_callable
+        execution_length = input_ids.size(1)
+        cache_position = torch.arange(execution_length, device=device, dtype=torch.int64)
         cache = StaticCache(
-            config=self.prediction_network.config,
+            config=base_decoder.config,
             max_batch_size=batch_size,
             max_cache_len=self.max_length,
             device=device,
             dtype=dtype
         )
-        outputs, _ = self.prediction_network(
+        outputs, _ = prefill_network(
             input_ids=input_ids,
             attn_mask=attn_mask,
             position_ids=position_ids,
@@ -145,7 +179,12 @@ class RNNTInfer:
         next_token_logits = outputs.transpose(1, 2)[torch.arange(batch_size), valid_lengths - 1].unsqueeze(1)
         # Grow this mask one column only when a non-blank token is
         # emitted. Its width then tracks the number of populated cache slots.
-        next_attn_mask = attn_mask
+        if self.decoder_runtime.decode_step is not None:
+            if attn_mask.size(1) > self.max_length:
+                raise ValueError("Prompt attention mask exceeds the static decoder cache")
+            next_attn_mask = F.pad(attn_mask, (0, self.max_length - attn_mask.size(1)), value=0)
+        else:
+            next_attn_mask = attn_mask
         # position_ids / cache_position follow the SAME "last consumed token"
         # convention: both index valid_lengths - 1. The decode loop increments
         # them by 1 (in the emit block) before the next forward, so the first
@@ -170,7 +209,8 @@ class RNNTInfer:
         assert input_ids.size(1) == 1, "input_ids should have shape (batch_size, 1)"
         assert input_ids.size(1) == position_ids.size(1), "input_ids and position_ids should have the same length"
         if decoder_logits is None:
-            decoder_logits, _ = self.prediction_network(
+            prediction_network = self.decoder_runtime.step_callable
+            decoder_logits, _ = prediction_network(
                 input_ids=input_ids,
                 attn_mask=attn_mask,
                 position_ids=position_ids,
@@ -209,16 +249,25 @@ class LoopLabelRNNTInfer(RNNTInfer):
             for _ in range(batch_size)
         ]
         symbols_added = torch.zeros(batch_size, dtype=torch.int32, device=encoder_output.device)
+        total_symbols_added = torch.zeros(batch_size, dtype=torch.int32, device=encoder_output.device)
         while b2active.any() and cache_position < self.max_length:
             find_next_token_or_end = torch.zeros(batch_size, dtype=torch.bool)
             while not find_next_token_or_end.all():
                 if dec_out is None:
                     dec_out = self.forward_decoder_one_step(input_ids, attn_mask, position_ids, cache, cache_position)
                 token_probs = self.joint_network(encoder_output[torch.arange(batch_size), safe_time, ].unsqueeze(1), dec_out)
-                predictions = torch.argmax(token_probs, dim=-1).squeeze(1)
-                # Force to add blank token if symbols_added >= self.max_symbols_per_step
-                predictions[symbols_added >= self.max_symbols_per_step] = self.blank_idx
-                blank_mask = (predictions == self.blank_idx).squeeze(1)
+                predictions = torch.argmax(token_probs, dim=-1).reshape(batch_size)
+                # A token is written at cache_position + 1. Do not overrun the
+                # static cache, and enforce both the per-frame and utterance caps.
+                cache_full = bool((cache_position + 1 >= self.max_length).item())
+                force_blank = (
+                    (symbols_added >= self.max_symbols_per_step)
+                    | (total_symbols_added >= self.max_symbols)
+                )
+                if cache_full:
+                    force_blank.fill_(True)
+                predictions[force_blank] = self.blank_idx
+                blank_mask = predictions == self.blank_idx
                 b2time[blank_mask] += 1
 
                 # Reset symbols_added if blank token is added
@@ -230,7 +279,8 @@ class LoopLabelRNNTInfer(RNNTInfer):
             if not blank_mask.all():
                 # The emitted token is consumed by the decoder on the next
                 # forward at cache_position + 1.
-                attn_mask = F.pad(attn_mask, (0, 1), value=0)
+                if self.decoder_runtime.decode_step is None:
+                    attn_mask = F.pad(attn_mask, (0, 1), value=0)
                 for b in range(batch_size):
                     if predictions[b] != self.blank_idx:
                         input_ids[b, 0] = predictions[b]
@@ -240,6 +290,7 @@ class LoopLabelRNNTInfer(RNNTInfer):
                         attn_mask[b, cache_position + 1] = 1
                         position_ids[b, 0] = position_ids[b, 0] + 1
                         symbols_added[b] += 1
+                        total_symbols_added[b] += 1
                         hyps[b].y_sequence.append(predictions[b].item())
                     else:
                         attn_mask[b, cache_position + 1] = 0
@@ -250,6 +301,7 @@ class LoopLabelRNNTInfer(RNNTInfer):
 class LoopFrameRNNTInfer(RNNTInfer):
     # Fixed latency decoding strategy with lower throughput and might generate more zombie cache
     def decode(self, encoder_output, input_ids=None, attn_mask=None, position_ids=None, cache=None, cache_position=None):
+        encoder_output = encoder_output.transpose(1, 2)
         batch_size, max_time, _ = encoder_output.shape
         device = encoder_output.device
         if cache is None:
@@ -268,25 +320,35 @@ class LoopFrameRNNTInfer(RNNTInfer):
             for _ in range(batch_size)
         ]
         symbols_added = torch.zeros(batch_size, dtype=torch.int32, device=encoder_output.device)
+        total_symbols_added = torch.zeros(batch_size, dtype=torch.int32, device=encoder_output.device)
         for t in range(max_time):
             while True:
                 if dec_out is None:
                     dec_out = self.forward_decoder_one_step(input_ids, attn_mask, position_ids, cache, cache_position)
                 token_probs = self.joint_network(encoder_output[torch.arange(batch_size), t:t+1, :], dec_out)
-                predictions = torch.argmax(token_probs, dim=-1).squeeze(1)
-                predictions[symbols_added >= self.max_symbols_per_step] = self.blank_idx
+                predictions = torch.argmax(token_probs, dim=-1).reshape(batch_size)
+                cache_full = bool((cache_position + 1 >= self.max_length).item())
+                force_blank = (
+                    (symbols_added >= self.max_symbols_per_step)
+                    | (total_symbols_added >= self.max_symbols)
+                )
+                if cache_full:
+                    force_blank.fill_(True)
+                predictions[force_blank] = self.blank_idx
                 blank_mask = predictions == self.blank_idx
                 symbols_added[blank_mask] = 0
                 if blank_mask.all():
                     break
                 else:
-                    attn_mask = F.pad(attn_mask, (0, 1), value=0)
+                    if self.decoder_runtime.decode_step is None:
+                        attn_mask = F.pad(attn_mask, (0, 1), value=0)
                     for b in range(batch_size):
                         if predictions[b] != self.blank_idx:
                             input_ids[b, 0] = predictions[b]
                             attn_mask[b, cache_position + 1] = 1
                             position_ids[b, 0] = position_ids[b, 0] + 1
                             symbols_added[b] += 1
+                            total_symbols_added[b] += 1
                             hyps[b].y_sequence.append(predictions[b].item())
                 dec_out = None
                 cache_position = cache_position + 1
@@ -300,24 +362,58 @@ class RNNTDecoding(ConfidenceMethodMixin):
     This class inherits from AbstractRNNTDecoding and provides decoding functionality
     for RNN-T models with BPE or subword tokenizers.
     """
-    def __init__(self, decoding_cfg, decoder, joint, tokenizer, blank_id=0):
+    def __init__(
+        self,
+        decoding_cfg,
+        decoder=None,
+        joint=None,
+        tokenizer=None,
+        blank_id=0,
+        decoder_runtime: Optional[DecoderRuntime] = None,
+    ):
         """
         Args:
             decoding_cfg: DictConfig with decoding configuration
-            decoder: The Decoder/Prediction network module
+            decoder: Canonical decoder module (legacy eager construction path)
+            decoder_runtime: Explicit decoder execution variants
             joint: The Joint network module  
             tokenizer: The tokenizer which will be used for decoding
             supported_punctuation: Optional set of punctuation marks in the vocabulary
         """
         super().__init__()
+        if decoder_runtime is None:
+            if decoder is None:
+                raise ValueError("decoder or decoder_runtime must be provided")
+            decoder_runtime = DecoderRuntime.eager(decoder)
+        elif decoder is not None and decoder is not decoder_runtime.base:
+            raise ValueError("decoder must match decoder_runtime.base")
+        self.decoder_runtime = decoder_runtime
+        decoder = decoder_runtime.base
         self.cfg = decoding_cfg
         self.blank_id = blank_id
         self.tokenizer = tokenizer
         self.compute_timestamps = self.cfg.get('compute_timestamps', None)
         self.preserve_alignments = self.cfg.get('preserve_alignments', None)
         self.preserve_frame_confidence = self.cfg.get('preserve_frame_confidence', None)
-        self.max_length = self.cfg.get('max_length', 1024)
-        self.max_symbols_per_step = self.cfg.get('max_symbols_per_step', 10)
+        self.max_length = int(self.cfg.get('max_length', 1024))
+        self.prefill_bucket_size = int(self.cfg.get('prefill_bucket_size', 0))
+        self.max_symbols_per_step = int(self.cfg.get('max_symbols_per_step', 10))
+        self.max_symbols = int(self.cfg.get('greedy', {}).get('max_symbols', self.max_length))
+        if self.max_length < 3:
+            raise ValueError("decoding.max_length must reserve BOS, language, and at least one output slot")
+        if self.max_symbols < 1:
+            raise ValueError("decoding.greedy.max_symbols must be positive")
+        if self.prefill_bucket_size < 0:
+            raise ValueError("decoding.prefill_bucket_size cannot be negative")
+        # Keep half of the configured total output allowance available even for
+        # long manifest context. The remaining slots are prompt history.
+        self.reserved_output_tokens = max(1, self.max_symbols // 2)
+        self.max_prompt_length = self.max_length - self.reserved_output_tokens
+        if self.max_prompt_length < 2:
+            raise ValueError(
+                "decoding.max_length is too small for the output reservation implied by "
+                "decoding.greedy.max_symbols"
+            )
         
         # Override decoding strategy instantiation for greedy_batch
         if self.cfg.strategy == "LoopLabel":
@@ -327,7 +423,9 @@ class RNNTDecoding(ConfidenceMethodMixin):
                 bos_idx=self.blank_id,
                 blank_idx=self.blank_id,
                 max_length=self.max_length,
+                prefill_bucket_size=self.prefill_bucket_size,
                 max_symbols_per_step=self.max_symbols_per_step,
+                max_symbols=self.max_symbols,
                 preserve_alignments=self.preserve_alignments,
                 preserve_frame_confidence=self.preserve_frame_confidence,
                 compute_timestamps=self.compute_timestamps,
@@ -339,13 +437,38 @@ class RNNTDecoding(ConfidenceMethodMixin):
                 bos_idx=self.blank_id,
                 blank_idx=self.blank_id,
                 max_length=self.max_length,
+                prefill_bucket_size=self.prefill_bucket_size,
                 max_symbols_per_step=self.max_symbols_per_step,
+                max_symbols=self.max_symbols,
                 preserve_alignments=self.preserve_alignments,
                 preserve_frame_confidence=self.preserve_frame_confidence,
                 compute_timestamps=self.compute_timestamps,
             )
         else:
             raise ValueError(f"Invalid strategy: {self.cfg.strategy}")
+        self.decoding.set_decoder_runtime(decoder_runtime)
+
+    def set_decoder_runtime(self, runtime: DecoderRuntime) -> None:
+        self.decoding.set_decoder_runtime(runtime)
+        self.decoder_runtime = runtime
+
+    def prepare_prompt(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Bound a single utterance prompt without dropping BOS or language.
+
+        Dataset contexts are already left-truncated for training. Validation can
+        still receive a longer prompt than the fixed StaticCache permits, so keep
+        the most recent history while retaining the two required special tokens.
+        """
+        if input_ids.ndim != 2 or input_ids.shape[0] < 1:
+            raise ValueError("RNN-T prompts must have shape [batch, prompt_length]")
+        if input_ids.shape[1] < 2:
+            raise ValueError("RNN-T prompts must contain BOS and a language token")
+        if input_ids.shape[1] <= self.max_prompt_length:
+            return input_ids
+        history_budget = self.max_prompt_length - 2
+        if history_budget == 0:
+            return input_ids[:, :2]
+        return torch.cat((input_ids[:, :2], input_ids[:, -history_budget:]), dim=1)
 
 
     

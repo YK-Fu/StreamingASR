@@ -1,4 +1,7 @@
 
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
@@ -9,6 +12,34 @@ dtype_map = {
     "fp16": torch.float16,
     "fp32": torch.float32,
 }
+
+
+@dataclass(frozen=True)
+class DecoderRuntime:
+    """Execution variants that share one canonical decoder's parameters.
+
+    Only ``train`` is registered on the parent ASR model. The decode variants
+    are held by the plain runtime object, preventing duplicate state-dict
+    entries while allowing different compile backends.
+    """
+
+    base: nn.Module
+    train: nn.Module
+    decode_step: Optional[nn.Module] = None
+    decode_prefill: Optional[nn.Module] = None
+
+    @classmethod
+    def eager(cls, decoder: nn.Module) -> "DecoderRuntime":
+        return cls(base=decoder, train=decoder)
+
+    @property
+    def step_callable(self) -> nn.Module:
+        return self.decode_step if self.decode_step is not None else self.base
+
+    @property
+    def prefill_callable(self) -> nn.Module:
+        return self.decode_prefill if self.decode_prefill is not None else self.base
+
 
 class LLMDecoder(nn.Module):
     def __init__(self, config, gradient_checkpointing=False, dtype="bf16", freeze=False, freeze_ffn=False, **kwargs):

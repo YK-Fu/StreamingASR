@@ -353,23 +353,36 @@ class PrunedRNNTJoint(RNNTJoint):
                     original_sync = self.wer._to_sync
                     self.wer._to_sync = False
 
-                # Seed the greedy RNN-T decoder with the same prompt prefix the
-                # model was trained on: context[:, :target_start] = [bos, <language>, ...].
-                # The loss aligns the transcript starting from the post-prompt predictor
-                # state (s=0 is the causal decoder state at target_start-1), so the joint
-                # is only ever trained on prompt-conditioned predictor states; decoding
-                # from bos alone is out-of-distribution and emits only blanks. Slice to
-                # the COMMON prefix (min target_start) so no transcription token is
-                # ever leaked for variable-length prompts.
-                prompt_len = int(target_start.min().item())
-                prompt_ids = transcripts[:, :prompt_len] if prompt_len > 0 else None
-                self.wer.update(
-                    predictions=encoder_outputs,
-                    predictions_lengths=encoder_lengths,
-                    targets=targets,
-                    targets_lengths=target_end - target_start,
-                    input_ids=prompt_ids,
-                )
+                # The predictor is trained on [BOS, language, manifest context].
+                # StaticCache has one cache-position sequence per decode call, so
+                # mixed prompt lengths must be dispatched one utterance at a time.
+                # This validation-only path retains each sample's actual context;
+                # training WER keeps its existing batched fast path.
+                if self.training:
+                    prompt_len = int(target_start.min().item())
+                    prompt_ids = transcripts[:, :prompt_len] if prompt_len > 0 else None
+                    if prompt_ids is not None:
+                        prompt_ids = self.wer.decoding.prepare_prompt(prompt_ids)
+                    self.wer.update(
+                        predictions=encoder_outputs,
+                        predictions_lengths=encoder_lengths,
+                        targets=targets,
+                        targets_lengths=target_end - target_start,
+                        input_ids=prompt_ids,
+                    )
+                else:
+                    for sample_idx in range(encoder_outputs.shape[0]):
+                        prompt_end = int(target_start[sample_idx].item())
+                        prompt_ids = self.wer.decoding.prepare_prompt(
+                            transcripts[sample_idx : sample_idx + 1, :prompt_end]
+                        )
+                        self.wer.update(
+                            predictions=encoder_outputs[sample_idx : sample_idx + 1],
+                            predictions_lengths=encoder_lengths[sample_idx : sample_idx + 1],
+                            targets=targets[sample_idx : sample_idx + 1],
+                            targets_lengths=(target_end - target_start)[sample_idx : sample_idx + 1],
+                            input_ids=prompt_ids,
+                        )
                 # Sync and all_reduce on all processes, compute global WER
                 wer, wer_num, wer_denom = self.wer.compute()
                 self.wer.reset()

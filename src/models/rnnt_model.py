@@ -31,6 +31,7 @@ from nemo.core.classes.mixins import AccessMixin
 
 from src.loss import CTCLoss, NLLLoss
 from src.decoding_utils import CTCDecoding, RNNTDecoding, WER
+from src.modules.transformer_decoder import DecoderRuntime
 from src.datasets import get_asr_dataset, ResumableDataloader, ResumableSampler
 from src.token_augmentation import (
     ctc_aligned_token_substitution,
@@ -166,6 +167,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             self.encoder.eval()
             logging.info("Encoder fully frozen: forcing eval() and disabling autograd through encoder forward")
         self.decoder = HybridRNNTCTCWhisperLMModel.from_config_dict(self.cfg.decoder)
+        self._decoder_runtime = DecoderRuntime.eager(self.decoder)
 
         if hasattr(self.cfg, 'aux_llm') and self.cfg.aux_llm.llm_loss_weight > 0:
             self.llm_loss = NLLLoss(
@@ -199,7 +201,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         # Setup decoding object
         self.decoding = RNNTDecoding(
             decoding_cfg=self.cfg.decoding,
-            decoder=self.decoder,
+            decoder_runtime=self._decoder_runtime,
             joint=self.joint,
             tokenizer=self.tokenizer,
             blank_id=self.blank_id,
@@ -305,6 +307,18 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             persistent_workers=config.get('num_workers', 0) > 0,
         )
 
+    @property
+    def decoder_runtime(self) -> DecoderRuntime:
+        return self._decoder_runtime
+
+    def install_decoder_runtime(self, runtime: DecoderRuntime) -> None:
+        """Install execution variants without duplicating decoder parameters."""
+        if runtime.base is not self._decoder_runtime.base:
+            raise ValueError("DecoderRuntime.base must be the model's canonical decoder")
+        self.decoder = runtime.train
+        self._decoder_runtime = runtime
+        self.decoding.set_decoder_runtime(runtime)
+
     def change_decoding_strategy(
         self, decoding_cfg: DictConfig = None, decoder_type: str = None, verbose: bool = True
     ):
@@ -326,7 +340,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
 
             self.decoding = RNNTDecoding(
                 decoding_cfg=decoding_cfg,
-                decoder=self.decoder,
+                decoder_runtime=self._decoder_runtime,
                 joint=self.joint,
                 tokenizer=self.tokenizer,
                 blank_id=self.blank_id,
@@ -973,4 +987,3 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             super().save_to(save_path)
         finally:
             self.state_dict = real_state_dict
-

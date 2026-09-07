@@ -18,6 +18,7 @@ from nemo.core.config.optimizers import AdamWParams
 register_optimizer("adamw_8bit", bnb.optim.AdamW8bit, AdamWParams)
 
 from src.models.rnnt_model import HybridRNNTCTCWhisperLMModel
+from src.modules.transformer_decoder import DecoderRuntime
 
 
 @hydra_runner(config_path="./conf", config_name="hybrid_transducer_ctc")
@@ -59,8 +60,35 @@ def main(cfg):
         asr_model.encoder = torch.compile(
             asr_model.encoder, dynamic=True, fullgraph=False
         )
-        asr_model.decoder = torch.compile(
-            asr_model.decoder, dynamic=False, fullgraph=False
+        # Keep the original static whole-decoder compilation used by training.
+        # RNNTDecoding retains the eager module for cache construction and gets
+        # the validation-specific compiled callables below.
+        base_decoder = asr_model.decoder_runtime.base
+        training_decoder = torch.compile(
+            base_decoder, dynamic=False, fullgraph=False
+        )
+        # Reuse the static compiled training wrapper for validation. Incremental
+        # decoding has one fixed shape; prompt prefill is padded to the finite
+        # bucket shapes configured by decoding.prefill_bucket_size.
+        validation_prefill_decoder = None
+        if asr_model.decoding.prefill_bucket_size > 0:
+            # Multi-token attention selects a generated Triton softmax kernel
+            # that is broken in the installed torch/Triton pair
+            # (KernelMetadata.cluster_dims is missing). CUDA Graphs still
+            # compiles/captures each fixed bucket without Triton codegen.
+            validation_prefill_decoder = torch.compile(
+                base_decoder,
+                dynamic=False,
+                fullgraph=False,
+                backend="cudagraphs",
+            )
+        asr_model.install_decoder_runtime(
+            DecoderRuntime(
+                base=base_decoder,
+                train=training_decoder,
+                decode_step=training_decoder,
+                decode_prefill=validation_prefill_decoder,
+            )
         )
         asr_model.ctc_decoder = torch.compile(
             asr_model.ctc_decoder, dynamic=True, fullgraph=False
