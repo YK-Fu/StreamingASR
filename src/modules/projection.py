@@ -167,7 +167,11 @@ class PrunedRNNTJoint(RNNTJoint):
 
         layers = (
             [act]
-            + ([torch.nn.Dropout(p=dropout)] if dropout else [])
+            # Keep the Dropout module even when p=0 so changing only the
+            # probability does not renumber the final Linear in the state dict
+            # (joint_net.2). This preserves compatibility with checkpoints
+            # created with nonzero dropout.
+            + ([torch.nn.Dropout(p=float(dropout))] if dropout is not None else [])
             + [torch.nn.Linear(joint_n_hidden, num_classes)]
         )
         return pred, enc, torch.nn.Sequential(*layers)
