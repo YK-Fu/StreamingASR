@@ -20,8 +20,17 @@ Usage examples:
 
 import argparse
 import os
+import sys
 import tarfile
 import tempfile
+from pathlib import Path
+
+# Allow both ``python -m ckpt_conversion.convert_distill_to_rnnt`` and the
+# documented direct-script invocation from the repository root.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import torch
 from typing import Dict, Optional
 from collections import OrderedDict
@@ -442,6 +451,20 @@ def main():
     )
 
     parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Override model.tokenizer.path from the RNN-T config",
+    )
+
+    parser.add_argument(
+        "--language-file",
+        type=str,
+        default=None,
+        help="Override model.encoder.language_file from the RNN-T config",
+    )
+
+    parser.add_argument(
         "--init-joint-from-ctc",
         action="store_true",
         help="Initialize the joint's final classifier from the CTC head and "
@@ -470,6 +493,10 @@ def main():
         config.model.train_ds.manifest_filepath = []
         config.model.validation_ds.manifest_filepath = []
         config.model.test_ds.manifest_filepath = []
+        if args.tokenizer is not None:
+            config.model.tokenizer.path = args.tokenizer
+        if args.language_file is not None:
+            config.model.encoder.language_file = args.language_file
     dummy_trainer = pl.Trainer(**resolve_trainer_cfg(config.trainer))
 
     # Load distillation checkpoint

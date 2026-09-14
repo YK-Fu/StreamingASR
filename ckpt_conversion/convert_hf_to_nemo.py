@@ -422,10 +422,18 @@ def main():
     with open_dict(config):
         config.trainer.devices = 1
         config.trainer.num_nodes = 1
+        # Checkpoint conversion is a single-process operation. Reusing a training
+        # config with strategy=ddp needlessly initializes MPI and fails on hosts
+        # without an MPI network interface (including CPU-only conversion hosts).
+        config.trainer.strategy = "auto"
         config.model.train_ds.manifest_filepath = []
         config.model.validation_ds.manifest_filepath = []
         config.model.test_ds.manifest_filepath = []
-    dummy_trainer = pl.Trainer(**resolve_trainer_cfg(config.trainer))
+    # ModelPT accepts trainer=None, and conversion never trains or builds data
+    # loaders. Avoid constructing a Lightning Trainer here: some NeMo container
+    # builds initialize MPI while creating it, which makes an otherwise CPU-only,
+    # single-process conversion depend on host MPI networking.
+    dummy_trainer = None
     # Validate arguments
     if config.model.get("teacher", None) is not None:
         if args.whisper is None:
