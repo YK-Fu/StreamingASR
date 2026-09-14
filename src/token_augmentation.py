@@ -278,6 +278,101 @@ def mask_token_attention(
     return augmented, selected.sum(), eligible_count
 
 
+@torch.no_grad()
+def random_context_deletion(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    probability: float,
+    pad_token_id: int,
+    token_start: int = 2,
+    text_bucket_size: int | None = None,
+    protected_ids: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Physically delete randomly selected predictor-context tokens.
+
+    Positions before ``token_start`` (normally BOS and language), plus IDs in
+    ``protected_ids``, are protected. Every other active token is independently
+    deleted with ``probability`` and the remaining tokens are compacted.
+    ``output_indices`` maps every state on
+    the pre-deletion predictor axis to the corresponding compacted state; a
+    deleted token reuses the previous retained state. This makes the operation
+    composable with the variable-length histories returned by
+    :func:`ctc_greedy_history` without changing any clean loss target.
+
+    Returns the compacted IDs, compacted attention mask, pre-deletion to
+    post-deletion state indices, deleted-token count, and eligible-token count.
+    """
+    if input_ids.ndim != 2 or attention_mask.ndim != 2:
+        raise ValueError("input_ids and attention_mask must have shape [batch, sequence]")
+    if input_ids.shape != attention_mask.shape:
+        raise ValueError("input_ids and attention_mask must have the same shape")
+    if token_start < 1 or token_start > input_ids.shape[1]:
+        raise ValueError("token_start must be in [1, sequence_width]")
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("probability must be in [0, 1]")
+    if text_bucket_size is not None and text_bucket_size < 1:
+        raise ValueError("text_bucket_size must be positive or None")
+
+    batch_size, original_width = input_ids.shape
+    active = attention_mask.bool()
+    positions = torch.arange(original_width, device=input_ids.device).unsqueeze(0)
+    eligible = active & (positions >= token_start)
+    if protected_ids is not None and protected_ids.numel() > 0:
+        protected_ids = protected_ids.to(device=input_ids.device)
+        eligible &= ~(
+            input_ids.unsqueeze(-1) == protected_ids.reshape(1, 1, -1)
+        ).any(dim=-1)
+    eligible_count = eligible.sum()
+    identity_indices = torch.arange(
+        original_width, device=input_ids.device, dtype=torch.long
+    ).unsqueeze(0).expand(batch_size, -1).clone()
+    if probability == 0.0 or eligible_count == 0:
+        return (
+            input_ids,
+            attention_mask,
+            identity_indices,
+            eligible_count.new_zeros(()),
+            eligible_count,
+        )
+
+    deleted = eligible & (
+        torch.rand(input_ids.shape, device=input_ids.device) < probability
+    )
+    deleted_count = deleted.sum()
+    if deleted_count == 0:
+        return input_ids, attention_mask, identity_indices, deleted_count, eligible_count
+
+    keep = active & ~deleted
+    kept_lengths = keep.sum(dim=1)
+    compacted_width = int(kept_lengths.max().item())
+    if text_bucket_size is not None:
+        compacted_width = (
+            (compacted_width + text_bucket_size - 1) // text_bucket_size
+        ) * text_bucket_size
+
+    compacted = input_ids.new_full(
+        (batch_size, compacted_width), pad_token_id
+    )
+    compacted_mask = attention_mask.new_zeros((batch_size, compacted_width))
+    for batch_idx in range(batch_size):
+        retained = input_ids[batch_idx, keep[batch_idx]]
+        retained_length = retained.numel()
+        compacted[batch_idx, :retained_length] = retained
+        compacted_mask[batch_idx, :retained_length] = 1
+
+    # The hidden state at an original deleted position represents the same
+    # history boundary as the most recent retained token.
+    output_indices = keep.long().cumsum(dim=1).sub(1).clamp(min=0)
+    output_indices.clamp_(max=compacted_width - 1)
+    return (
+        compacted,
+        compacted_mask,
+        output_indices,
+        deleted_count,
+        eligible_count,
+    )
+
+
 def _levenshtein_insertions(
     reference: list[int], hypothesis: list[int]
 ) -> list[tuple[int, int]]:
@@ -351,6 +446,320 @@ def _collapse_ctc_path(
             collapsed.append(token_id)
         previous = token_id
     return collapsed
+
+
+def _levenshtein_boundary_map(
+    reference: list[int], hypothesis: list[int]
+) -> tuple[list[int], int, int, int]:
+    """Map clean-token boundaries to prefixes of a decoded hypothesis.
+
+    The returned list has ``len(reference) + 1`` entries. Entry ``i`` is the
+    number of hypothesis tokens consumed at the boundary before clean token
+    ``i``. Insertions at a boundary are therefore included in that boundary's
+    predictor history, while a deletion makes adjacent clean boundaries reuse
+    the same predictor state.
+
+    Minimum-edit backtraces deterministically prefer matches, substitutions,
+    deletions, then insertions. The three integer returns are the naturally
+    occurring substitution, deletion, and insertion counts.
+    """
+    ref_len = len(reference)
+    hyp_len = len(hypothesis)
+    costs = [[0] * (hyp_len + 1) for _ in range(ref_len + 1)]
+    for ref_idx in range(1, ref_len + 1):
+        costs[ref_idx][0] = ref_idx
+    for hyp_idx in range(1, hyp_len + 1):
+        costs[0][hyp_idx] = hyp_idx
+
+    for ref_idx in range(1, ref_len + 1):
+        for hyp_idx in range(1, hyp_len + 1):
+            costs[ref_idx][hyp_idx] = min(
+                costs[ref_idx - 1][hyp_idx - 1]
+                + int(reference[ref_idx - 1] != hypothesis[hyp_idx - 1]),
+                costs[ref_idx - 1][hyp_idx] + 1,
+                costs[ref_idx][hyp_idx - 1] + 1,
+            )
+
+    operations: list[str] = []
+    ref_idx = ref_len
+    hyp_idx = hyp_len
+    while ref_idx > 0 or hyp_idx > 0:
+        if (
+            ref_idx > 0
+            and hyp_idx > 0
+            and reference[ref_idx - 1] == hypothesis[hyp_idx - 1]
+            and costs[ref_idx][hyp_idx] == costs[ref_idx - 1][hyp_idx - 1]
+        ):
+            operations.append("match")
+            ref_idx -= 1
+            hyp_idx -= 1
+        elif (
+            ref_idx > 0
+            and hyp_idx > 0
+            and costs[ref_idx][hyp_idx] == costs[ref_idx - 1][hyp_idx - 1] + 1
+        ):
+            operations.append("substitution")
+            ref_idx -= 1
+            hyp_idx -= 1
+        elif (
+            ref_idx > 0
+            and costs[ref_idx][hyp_idx] == costs[ref_idx - 1][hyp_idx] + 1
+        ):
+            operations.append("deletion")
+            ref_idx -= 1
+        else:
+            if hyp_idx == 0:
+                raise RuntimeError("Invalid Levenshtein backtrace")
+            operations.append("insertion")
+            hyp_idx -= 1
+
+    operations.reverse()
+    boundary_hyp_lengths = [0] * (ref_len + 1)
+    ref_idx = 0
+    hyp_idx = 0
+    substitutions = 0
+    deletions = 0
+    insertions = 0
+    for operation in operations:
+        if operation == "match":
+            ref_idx += 1
+            hyp_idx += 1
+            boundary_hyp_lengths[ref_idx] = hyp_idx
+        elif operation == "substitution":
+            substitutions += 1
+            ref_idx += 1
+            hyp_idx += 1
+            boundary_hyp_lengths[ref_idx] = hyp_idx
+        elif operation == "deletion":
+            deletions += 1
+            ref_idx += 1
+            boundary_hyp_lengths[ref_idx] = hyp_idx
+        else:
+            insertions += 1
+            hyp_idx += 1
+            boundary_hyp_lengths[ref_idx] = hyp_idx
+
+    if ref_idx != ref_len or hyp_idx != hyp_len:
+        raise RuntimeError("Levenshtein alignment did not consume both sequences")
+    return boundary_hyp_lengths, substitutions, deletions, insertions
+
+
+@torch.no_grad()
+def ctc_greedy_history(
+    input_ids: torch.Tensor,
+    target_start: torch.Tensor,
+    target_end: torch.Tensor,
+    targets: torch.Tensor,
+    ctc_log_probs: torch.Tensor,
+    input_lengths: torch.Tensor,
+    blank_id: int,
+    pad_token_id: int,
+    sample_ratio: float,
+    text_bucket_size: int | None,
+    protected_ids: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Use complete online greedy CTC hypotheses as predictor histories.
+
+    Samples are selected independently with probability ``sample_ratio``.
+    Their clean transcript-history tokens are replaced by the collapsed CTC
+    hypothesis, while BOS/language/manifest context and all clean objectives
+    remain unchanged. ``output_indices`` maps variable-length hypothesis states
+    back to the original clean predictor axis required by the RNN-T and LM
+    losses.
+
+    Returns augmented IDs, attention mask, clean-axis output indices, selected
+    and changed sample counts, reference and hypothesis token counts, natural
+    substitution/deletion/insertion counts, and empty-hypothesis count.
+    """
+    if input_ids.ndim != 2 or targets.ndim != 2 or ctc_log_probs.ndim != 3:
+        raise ValueError(
+            "input_ids, targets, and ctc_log_probs must have shapes "
+            "[batch, sequence], [batch, target], and [batch, time, vocabulary]"
+        )
+    batch_size, original_width = input_ids.shape
+    if targets.shape[0] != batch_size or ctc_log_probs.shape[0] != batch_size:
+        raise ValueError("input_ids, targets, and ctc_log_probs batch sizes must match")
+    if target_start.shape != (batch_size,) or target_end.shape != (batch_size,):
+        raise ValueError("target_start and target_end must have shape [batch]")
+    if input_lengths.shape != (batch_size,):
+        raise ValueError("input_lengths must have shape [batch]")
+    if torch.any(target_start < 1) or torch.any(target_end < target_start):
+        raise ValueError("target boundaries must satisfy 1 <= start <= end")
+    if torch.any(target_end > original_width):
+        raise ValueError("target_end exceeds the decoder input width")
+    target_lengths = target_end - target_start
+    if torch.any(target_lengths > targets.shape[1]):
+        raise ValueError("target lengths exceed the padded targets width")
+    max_ctc_time = ctc_log_probs.shape[1]
+    if torch.any(input_lengths < 1) or torch.any(input_lengths > max_ctc_time):
+        raise ValueError("input_lengths must be in [1, ctc_time]")
+    if not 0.0 <= sample_ratio <= 1.0:
+        raise ValueError("sample_ratio must be in [0, 1]")
+    if text_bucket_size is not None and text_bucket_size < 1:
+        raise ValueError("text_bucket_size must be positive or None")
+
+    metric_zero = input_ids.new_zeros(())
+    identity_indices = torch.arange(
+        original_width, device=input_ids.device, dtype=torch.long
+    ).unsqueeze(0).expand(batch_size, -1).clone()
+    if sample_ratio == 0.0:
+        attention_mask = (input_ids != pad_token_id).long()
+        attention_mask[:, 0] = 1
+        return (
+            input_ids,
+            attention_mask,
+            identity_indices,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+        )
+
+    selected = torch.rand(batch_size, device=input_ids.device) < sample_ratio
+    selected_values = selected.detach().cpu().tolist()
+    selected_count = selected.sum()
+    if not any(selected_values):
+        attention_mask = (input_ids != pad_token_id).long()
+        attention_mask[:, 0] = 1
+        return (
+            input_ids,
+            attention_mask,
+            identity_indices,
+            selected_count,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+            metric_zero,
+        )
+
+    protected = {blank_id}
+    if protected_ids is not None:
+        protected.update(protected_ids.detach().cpu().tolist())
+    greedy_paths = ctc_log_probs.argmax(dim=-1).detach().cpu()
+    targets_cpu = targets.detach().cpu()
+    input_length_values = input_lengths.detach().cpu().tolist()
+    target_length_values = target_lengths.detach().cpu().tolist()
+
+    hypotheses: list[list[int] | None] = [None] * batch_size
+    boundary_maps: list[list[int] | None] = [None] * batch_size
+    changed_samples = 0
+    reference_tokens = 0
+    hypothesis_tokens = 0
+    substitutions = 0
+    deletions = 0
+    insertions = 0
+    empty_hypotheses = 0
+    for batch_idx, is_selected in enumerate(selected_values):
+        if not is_selected:
+            continue
+        reference = targets_cpu[
+            batch_idx, : target_length_values[batch_idx]
+        ].tolist()
+        hypothesis = _collapse_ctc_path(
+            greedy_paths[batch_idx, : input_length_values[batch_idx]].tolist(),
+            blank_id=blank_id,
+            protected_ids=protected,
+        )
+        boundary_map, sub_count, del_count, ins_count = _levenshtein_boundary_map(
+            reference, hypothesis
+        )
+        hypotheses[batch_idx] = hypothesis
+        boundary_maps[batch_idx] = boundary_map
+        changed_samples += int(reference != hypothesis)
+        reference_tokens += len(reference)
+        hypothesis_tokens += len(hypothesis)
+        substitutions += sub_count
+        deletions += del_count
+        insertions += ins_count
+        empty_hypotheses += int(not hypothesis)
+
+    required_width = max(
+        int(target_start[batch_idx].item())
+        + (
+            len(hypotheses[batch_idx])
+            if hypotheses[batch_idx] is not None
+            else target_length_values[batch_idx]
+        )
+        for batch_idx in range(batch_size)
+    )
+    if text_bucket_size is not None:
+        required_width = (
+            (required_width + text_bucket_size - 1) // text_bucket_size
+        ) * text_bucket_size
+    augmented_width = max(original_width, required_width)
+    augmented = input_ids.new_full((batch_size, augmented_width), pad_token_id)
+    if augmented_width > original_width:
+        output_indices = input_ids.new_full(
+            (batch_size, original_width), augmented_width - 1
+        )
+        output_indices.copy_(identity_indices)
+    else:
+        output_indices = identity_indices
+
+    for batch_idx, hypothesis in enumerate(hypotheses):
+        if hypothesis is None:
+            sequence_end = int(target_end[batch_idx].item())
+            augmented[batch_idx, :sequence_end] = input_ids[batch_idx, :sequence_end]
+            continue
+
+        transcript_start = int(target_start[batch_idx].item())
+        transcript_length = target_length_values[batch_idx]
+        augmented[batch_idx, :transcript_start] = input_ids[
+            batch_idx, :transcript_start
+        ]
+        if hypothesis:
+            augmented[
+                batch_idx, transcript_start : transcript_start + len(hypothesis)
+            ] = input_ids.new_tensor(hypothesis)
+
+        boundary_map = boundary_maps[batch_idx]
+        if boundary_map is None:
+            raise RuntimeError("Selected CTC-history sample has no boundary map")
+        clean_state_positions = (
+            transcript_start
+            - 1
+            + torch.arange(
+                transcript_length + 1, device=input_ids.device, dtype=torch.long
+            )
+        )
+        hypothesis_state_positions = input_ids.new_tensor(boundary_map)
+        hypothesis_state_positions += transcript_start - 1
+        output_indices[batch_idx, clean_state_positions] = hypothesis_state_positions
+
+    attention_mask = (augmented != pad_token_id).long()
+    attention_mask[:, 0] = 1
+    return (
+        augmented,
+        attention_mask,
+        output_indices,
+        selected_count,
+        selected_count.new_tensor(changed_samples),
+        selected_count.new_tensor(reference_tokens),
+        selected_count.new_tensor(hypothesis_tokens),
+        selected_count.new_tensor(substitutions),
+        selected_count.new_tensor(deletions),
+        selected_count.new_tensor(insertions),
+        selected_count.new_tensor(empty_hypotheses),
+    )
 
 
 @torch.no_grad()

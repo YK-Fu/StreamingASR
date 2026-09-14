@@ -34,9 +34,8 @@ from src.decoding_utils import CTCDecoding, RNNTDecoding, WER
 from src.modules.transformer_decoder import DecoderRuntime
 from src.datasets import get_asr_dataset, ResumableDataloader, ResumableSampler
 from src.token_augmentation import (
-    ctc_aligned_token_substitution,
-    ctc_insertion_recovery,
-    mask_token_attention,
+    ctc_greedy_history,
+    random_context_deletion,
 )
 
 class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCTCMixin):
@@ -67,46 +66,51 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         num_vocab = self.tokenizer.vocab_size
         self.blank_id = self.tokenizer.token_to_id(self.cfg.tokenizer.blank_token)
         token_augmentation_cfg = self.cfg.get("token_augmentation", {})
-        ctc_as_input_cfg = token_augmentation_cfg.get("ctc_as_input", {})
-        self.ctc_as_input_enabled = bool(ctc_as_input_cfg.get("enabled", False))
-        self.ctc_as_input_ratio = float(ctc_as_input_cfg.get("ratio", 0.0))
-        if not 0.0 <= self.ctc_as_input_ratio <= 1.0:
-            raise ValueError("token_augmentation.ctc_as_input.ratio must be in [0, 1]")
-
-        attention_mask_cfg = token_augmentation_cfg.get("attention_mask", {})
-        self.token_attention_mask_enabled = bool(
-            attention_mask_cfg.get("enabled", False)
+        ctc_history_cfg = token_augmentation_cfg.get("ctc_history", {})
+        self.ctc_history_enabled = bool(ctc_history_cfg.get("enabled", False))
+        self.ctc_history_sample_ratio = float(
+            ctc_history_cfg.get("sample_ratio", 0.0)
         )
-        self.token_attention_mask_probability = float(
-            attention_mask_cfg.get("probability", 0.0)
+        self.ctc_history_warmup_steps = int(
+            ctc_history_cfg.get("warmup_steps", 0)
         )
-        if not 0.0 <= self.token_attention_mask_probability <= 1.0:
+        self.ctc_history_ramp_steps = int(
+            ctc_history_cfg.get("ramp_steps", 0)
+        )
+        if not 0.0 <= self.ctc_history_sample_ratio <= 1.0:
             raise ValueError(
-                "token_augmentation.attention_mask.probability "
+                "token_augmentation.ctc_history.sample_ratio must be in [0, 1]"
+            )
+        if self.ctc_history_warmup_steps < 0:
+            raise ValueError(
+                "token_augmentation.ctc_history.warmup_steps must be non-negative"
+            )
+        if self.ctc_history_ramp_steps < 0:
+            raise ValueError(
+                "token_augmentation.ctc_history.ramp_steps must be non-negative"
+            )
+        context_deletion_cfg = token_augmentation_cfg.get("context_deletion", {})
+        self.context_deletion_enabled = bool(
+            context_deletion_cfg.get("enabled", False)
+        )
+        self.context_deletion_probability = float(
+            context_deletion_cfg.get("probability", 0.0)
+        )
+        if not 0.0 <= self.context_deletion_probability <= 1.0:
+            raise ValueError(
+                "token_augmentation.context_deletion.probability "
                 "must be in [0, 1]"
             )
-        insertion_cfg = token_augmentation_cfg.get("ctc_insertion", {})
-        self.ctc_insertion_enabled = bool(insertion_cfg.get("enabled", False))
-        self.ctc_insertion_sample_probability = float(
-            insertion_cfg.get("sample_probability", 0.0)
-        )
-        if not 0.0 <= self.ctc_insertion_sample_probability <= 1.0:
-            raise ValueError(
-                "token_augmentation.ctc_insertion.sample_probability "
-                "must be in [0, 1]"
-            )
-        enabled_history_augmentations = sum(
-            (
-                self.ctc_as_input_enabled,
-                self.token_attention_mask_enabled,
-                self.ctc_insertion_enabled,
-            )
-        )
-        if enabled_history_augmentations > 1:
-            raise ValueError(
-                "ctc_as_input, attention_mask, and ctc_insertion are mutually "
-                "exclusive token augmentations"
-            )
+        # Reject obsolete manually designed edit modes when restoring an older
+        # config. Natural substitutions/deletions/insertions now come only from
+        # the complete greedy CTC hypothesis.
+        for legacy_name in ("ctc_as_input", "attention_mask", "ctc_insertion"):
+            legacy_cfg = token_augmentation_cfg.get(legacy_name, {})
+            if bool(legacy_cfg.get("enabled", False)):
+                raise ValueError(
+                    f"token_augmentation.{legacy_name} is obsolete; use "
+                    "ctc_history.sample_ratio and optional context_deletion"
+                )
 
         text_bucket_size = self.cfg.train_ds.get("text_bucket_size", None)
         self.token_augmentation_text_bucket_size = (
@@ -126,20 +130,17 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             persistent=False,
         )
 
-        if self.ctc_as_input_enabled:
+        if self.ctc_history_enabled:
             logging.info(
-                "CTC-as-input scheduled sampling enabled: "
-                f"token_ratio={self.ctc_as_input_ratio}"
+                "Full greedy CTC-history scheduled sampling enabled: "
+                f"sample_ratio={self.ctc_history_sample_ratio}, "
+                f"warmup_steps={self.ctc_history_warmup_steps}, "
+                f"ramp_steps={self.ctc_history_ramp_steps}"
             )
-        if self.token_attention_mask_enabled:
+        if self.context_deletion_enabled:
             logging.info(
-                "Context/transcript attention masking enabled: "
-                f"token_probability={self.token_attention_mask_probability}"
-            )
-        if self.ctc_insertion_enabled:
-            logging.info(
-                "CTC-derived insertion recovery enabled: "
-                f"sample_probability={self.ctc_insertion_sample_probability}, "
+                "Random predictor-context deletion enabled: "
+                f"token_probability={self.context_deletion_probability}, "
                 f"text_bucket_size={self.token_augmentation_text_bucket_size}"
             )
         # Fill the -1 num_classes placeholders for the dedicated simple projections.
@@ -319,6 +320,32 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         self._decoder_runtime = runtime
         self.decoding.set_decoder_runtime(runtime)
 
+    def _ctc_history_ratio_at_step(self, step: int) -> float:
+        """Return the per-utterance CTC-history probability at an optimizer step."""
+        if not self.ctc_history_enabled or self.ctc_history_sample_ratio == 0.0:
+            return 0.0
+        if step < self.ctc_history_warmup_steps:
+            return 0.0
+        if self.ctc_history_ramp_steps == 0:
+            return self.ctc_history_sample_ratio
+        ramp_progress = min(
+            max((step - self.ctc_history_warmup_steps) / self.ctc_history_ramp_steps, 0.0),
+            1.0,
+        )
+        return self.ctc_history_sample_ratio * ramp_progress
+
+    def _rnnt_loss_weights_at_step(self, step: int) -> tuple[float, float]:
+        """Linearly trade simple-loss weight for full pruned RNN-T weight."""
+        ramp_steps = int(
+            self.cfg.loss.get(
+                "loss_warm_steps", self.cfg.optim.sched.get("warmup_steps", 1)
+            )
+        )
+        if ramp_steps <= 0:
+            return 0.5, 1.0
+        progress = min(max(step / ramp_steps, 0.0), 1.0)
+        return 1.0 - 0.5 * progress, progress
+
     def change_decoding_strategy(
         self, decoding_cfg: DictConfig = None, decoder_type: str = None, verbose: bool = True
     ):
@@ -412,27 +439,17 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         decoder_context = context
         decoder_attn_mask = (decoder_context != self.blank_id).long()
         decoder_attn_mask[:, 0] = 1
-        attention_masked_tokens = context.new_zeros(())
-        attention_mask_eligible = context.new_zeros(())
-        if self.token_attention_mask_enabled:
-            (
-                decoder_attn_mask,
-                attention_masked_tokens,
-                attention_mask_eligible,
-            ) = mask_token_attention(
-                attention_mask=decoder_attn_mask,
-                token_end=target_end,
-                probability=self.token_attention_mask_probability,
-            )
-        ctc_input_selected = context.new_zeros(())
-        ctc_input_changed = context.new_zeros(())
-        ctc_input_disagreements = context.new_zeros(())
-        ctc_input_eligible = context.new_zeros(())
-        ctc_input_alignment_failures = context.new_zeros(())
+        context_deleted_tokens = context.new_zeros(())
+        context_deletion_eligible = context.new_zeros(())
         decoder_output_indices = None
-        insertion_selected_samples = context.new_zeros(())
-        insertion_candidate_tokens = context.new_zeros(())
-        insertion_applied_samples = context.new_zeros(())
+        ctc_history_selected_samples = context.new_zeros(())
+        ctc_history_changed_samples = context.new_zeros(())
+        ctc_history_reference_tokens = context.new_zeros(())
+        ctc_history_hypothesis_tokens = context.new_zeros(())
+        ctc_history_substitutions = context.new_zeros(())
+        ctc_history_deletions = context.new_zeros(())
+        ctc_history_insertions = context.new_zeros(())
+        ctc_history_empty_hypotheses = context.new_zeros(())
 
         # Do not pass length to the preprocessor, it will be computed in the preprocessor (padding as blank training)
         signal, signal_length = self.preprocessor(raw_speech=waveform, length=None)
@@ -446,40 +463,28 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         simple_am = self.simple_am_proj(encoded, return_logits=True, return_softmax=False)
         if (
             self.ctc_loss_weight > 0
-            or self.ctc_as_input_enabled
-            or self.ctc_insertion_enabled
+            or self.ctc_history_enabled
         ):
             ctc_output = self.ctc_decoder(encoded, return_logits=False, return_softmax=True)
 
-        if self.ctc_as_input_enabled and self.ctc_as_input_ratio > 0.0:
-            (
-                decoder_context,
-                ctc_input_selected,
-                ctc_input_changed,
-                ctc_input_disagreements,
-                ctc_input_eligible,
-                ctc_input_alignment_failures,
-            ) = ctc_aligned_token_substitution(
-                input_ids=decoder_context,
-                target_start=target_start,
-                target_end=target_end,
-                targets=target,
-                ctc_log_probs=ctc_output.detach(),
-                input_lengths=encoded_len,
-                blank_id=self.blank_id,
-                probability=self.ctc_as_input_ratio,
-            )
-            decoder_attn_mask = (decoder_context != self.blank_id).long()
-            decoder_attn_mask[:, 0] = 1
-        elif self.ctc_insertion_enabled:
+        ctc_history_effective_ratio = self._ctc_history_ratio_at_step(
+            self.trainer.global_step
+        )
+        ctc_history_active = ctc_history_effective_ratio > 0.0
+        if ctc_history_active:
             (
                 decoder_context,
                 decoder_attn_mask,
                 decoder_output_indices,
-                insertion_selected_samples,
-                insertion_candidate_tokens,
-                insertion_applied_samples,
-            ) = ctc_insertion_recovery(
+                ctc_history_selected_samples,
+                ctc_history_changed_samples,
+                ctc_history_reference_tokens,
+                ctc_history_hypothesis_tokens,
+                ctc_history_substitutions,
+                ctc_history_deletions,
+                ctc_history_insertions,
+                ctc_history_empty_hypotheses,
+            ) = ctc_greedy_history(
                 input_ids=decoder_context,
                 target_start=target_start,
                 target_end=target_end,
@@ -488,13 +493,35 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                 input_lengths=encoded_len,
                 blank_id=self.blank_id,
                 pad_token_id=self.blank_id,
-                sample_probability=self.ctc_insertion_sample_probability,
+                sample_ratio=ctc_history_effective_ratio,
                 text_bucket_size=self.token_augmentation_text_bucket_size,
                 protected_ids=self._token_augmentation_protected_ids,
             )
+        if self.context_deletion_enabled:
+            (
+                decoder_context,
+                decoder_attn_mask,
+                deletion_output_indices,
+                context_deleted_tokens,
+                context_deletion_eligible,
+            ) = random_context_deletion(
+                input_ids=decoder_context,
+                attention_mask=decoder_attn_mask,
+                probability=self.context_deletion_probability,
+                pad_token_id=self.blank_id,
+                token_start=2,
+                text_bucket_size=self.token_augmentation_text_bucket_size,
+                protected_ids=self._token_augmentation_protected_ids,
+            )
+            if decoder_output_indices is None:
+                decoder_output_indices = deletion_output_indices
+            else:
+                decoder_output_indices = deletion_output_indices.gather(
+                    1, decoder_output_indices
+                )
 
-        # Transcript targets remain clean. CTC substitution, attention masking,
-        # and insertion recovery perturb only the prediction-network input.
+        # Transcript targets remain clean. The complete CTC hypothesis and
+        # optional random deletion perturb only the prediction-network input.
         # Decoder forward. When the aux LLM loss is on, also fetch the native Qwen
         # lm_head logits (one fused forward); otherwise skip the lm_head entirely.
         if self.llm_loss is not None:
@@ -540,23 +567,20 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         else:
             llm_loss = 0
 
-        # Icefall-style discrete warmup: keep pruned_loss off entirely until the
-        # smoothed-loss path has trained simple_am_proj enough that
-        # k2.get_rnnt_prune_ranges covers the true alignment. Phase 1 (warmup<1):
-        # simple only. Phase 2 (1<=warmup<2): 10% pruned. Phase 3: full pruned,
-        # reduced simple.
-        loss_warm_steps = self.cfg.loss.get("loss_warm_steps", self.cfg.optim.sched.warmup_steps)
-        warmup = self.trainer.global_step / max(loss_warm_steps, 1)
-        if warmup < 1.0:
-            simple_loss_weight, rnnt_loss_weight = 1.0, 0.0
-        elif warmup < 2.0:
-            simple_loss_weight, rnnt_loss_weight = 1.0, 0.1
-        else:
-            simple_loss_weight, rnnt_loss_weight = 0.5, 1.0
+        # Smoothly move from the stable smoothed-loss alignment objective to the
+        # full pruned RNN-T objective, avoiding the former jumps at 1x/2x warmup.
+        simple_loss_weight, rnnt_loss_weight = self._rnnt_loss_weights_at_step(
+            self.trainer.global_step
+        )
         # Only enable delay_penalty once the alignment is well-learned. Applying it
         # earlier biases emission timing against an unreliable alignment and inflates
         # the negative-loss magnitude before WER has converged.
-        delay_penalty = self.cfg.loss.get("delay_penalty", 0.0) if warmup >= 10.0 else 0.0
+        loss_ramp_steps = int(self.cfg.loss.get("loss_warm_steps", 1))
+        delay_penalty = (
+            self.cfg.loss.get("delay_penalty", 0.0)
+            if self.trainer.global_step >= 10 * max(loss_ramp_steps, 1)
+            else 0.0
+        )
 
         # Fused joint step
         simple_loss, rnnt_loss, wer, _, _ = self.joint.forward_fused_loss(
@@ -590,37 +614,52 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'global_step': self.trainer.global_step,
         }
-        if self.token_attention_mask_enabled:
+        if self.ctc_history_enabled:
+            batch_size = context.new_tensor(context.shape[0])
+            edit_count = (
+                ctc_history_substitutions
+                + ctc_history_deletions
+                + ctc_history_insertions
+            )
             tensorboard_logs.update({
-                "train_attention_masked_tokens": attention_masked_tokens.detach(),
-                "train_attention_masked_rate": (
-                    attention_masked_tokens.float()
-                    / attention_mask_eligible.clamp(min=1)
+                "train_ctc_history_configured_ratio": context.new_tensor(
+                    self.ctc_history_sample_ratio, dtype=torch.float
+                ),
+                "train_ctc_history_effective_ratio": context.new_tensor(
+                    ctc_history_effective_ratio, dtype=torch.float
+                ),
+                "train_ctc_history_selected_samples": ctc_history_selected_samples.detach(),
+                "train_ctc_history_selected_rate": (
+                    ctc_history_selected_samples.float() / batch_size.clamp(min=1)
                 ).detach(),
+                "train_ctc_history_changed_samples": ctc_history_changed_samples.detach(),
+                "train_ctc_history_reference_tokens": ctc_history_reference_tokens.detach(),
+                "train_ctc_history_hypothesis_tokens": ctc_history_hypothesis_tokens.detach(),
+                "train_ctc_history_substitutions": ctc_history_substitutions.detach(),
+                "train_ctc_history_deletions": ctc_history_deletions.detach(),
+                "train_ctc_history_insertions": ctc_history_insertions.detach(),
+                "train_ctc_history_edit_rate": (
+                    edit_count.float() / ctc_history_reference_tokens.clamp(min=1)
+                ).detach(),
+                "train_ctc_history_empty_hypotheses": ctc_history_empty_hypotheses.detach(),
+                "train_ctc_history_decoder_width": context.new_tensor(
+                    decoder_context.shape[1]
+                ),
             })
-        if self.ctc_as_input_enabled:
+        tensorboard_logs.update({
+            "train_simple_loss_weight": context.new_tensor(
+                simple_loss_weight, dtype=torch.float
+            ),
+            "train_rnnt_loss_weight": context.new_tensor(
+                rnnt_loss_weight, dtype=torch.float
+            ),
+        })
+        if self.context_deletion_enabled:
             tensorboard_logs.update({
-                "train_ctc_input_selected_tokens": ctc_input_selected.detach(),
-                "train_ctc_input_selected_rate": (
-                    ctc_input_selected.float() / ctc_input_eligible.clamp(min=1)
-                ).detach(),
-                "train_ctc_input_changed_tokens": ctc_input_changed.detach(),
-                "train_ctc_input_changed_rate": (
-                    ctc_input_changed.float() / ctc_input_eligible.clamp(min=1)
-                ).detach(),
-                "train_ctc_input_disagreement_rate": (
-                    ctc_input_disagreements.float() / ctc_input_eligible.clamp(min=1)
-                ).detach(),
-                "train_ctc_input_alignment_failures": ctc_input_alignment_failures.detach(),
-            })
-        if self.ctc_insertion_enabled:
-            tensorboard_logs.update({
-                "train_insertion_selected_samples": insertion_selected_samples.detach(),
-                "train_insertion_candidate_tokens": insertion_candidate_tokens.detach(),
-                "train_insertion_applied_samples": insertion_applied_samples.detach(),
-                "train_insertion_applied_rate": (
-                    insertion_applied_samples.float()
-                    / insertion_selected_samples.clamp(min=1)
+                "train_context_deleted_tokens": context_deleted_tokens.detach(),
+                "train_context_deletion_rate": (
+                    context_deleted_tokens.float()
+                    / context_deletion_eligible.clamp(min=1)
                 ).detach(),
             })
         if self.llm_loss is not None:
@@ -731,14 +770,9 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         )
 
         if simple_loss is not None:
-            loss_warm_steps = self.cfg.loss.get("loss_warm_steps", self.cfg.optim.sched.warmup_steps)
-            warmup = self.trainer.global_step / max(loss_warm_steps, 1)
-            if warmup < 1.0:
-                simple_loss_weight, rnnt_loss_weight = 1.0, 0.0
-            elif warmup < 2.0:
-                simple_loss_weight, rnnt_loss_weight = 1.0, 0.1
-            else:
-                simple_loss_weight, rnnt_loss_weight = 0.5, 1.0
+            simple_loss_weight, rnnt_loss_weight = self._rnnt_loss_weights_at_step(
+                self.trainer.global_step
+            )
             tensorboard_logs['val_rnnt_loss'] = rnnt_loss.detach()
             tensorboard_logs['val_simple_loss'] = simple_loss.detach()
             tensorboard_logs['val_ctc_loss'] = ctc_loss.detach()
@@ -964,6 +998,30 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         if 'rng_state' in state_dict:
             torch.set_rng_state(state_dict['rng_state']['torch'])
             torch.cuda.set_rng_state_all(state_dict['rng_state']['cuda'])
+
+        # Lightning restores scheduler attributes from the checkpoint after the
+        # scheduler is constructed. When deliberately extending a run, retain
+        # the newly configured horizon rather than silently restoring the old
+        # one (which makes WarmupPolicy drop to min_lr after the old max_steps).
+        scheduler_cfg = self.cfg.optim.get('sched', None)
+        configured_max_steps = (
+            scheduler_cfg.get('max_steps', None)
+            if scheduler_cfg is not None
+            else None
+        )
+        if configured_max_steps is not None:
+            configured_max_steps = int(configured_max_steps)
+            for scheduler_state in state_dict.get('lr_schedulers', []):
+                restored_max_steps = scheduler_state.get('max_steps', None)
+                if (
+                    restored_max_steps is not None
+                    and int(restored_max_steps) != configured_max_steps
+                ):
+                    logging.info(
+                        "Updating restored LR scheduler max_steps from "
+                        f"{restored_max_steps} to {configured_max_steps}."
+                    )
+                    scheduler_state['max_steps'] = configured_max_steps
         super().on_load_checkpoint(state_dict)
 
     def save_to(self, save_path: str):
