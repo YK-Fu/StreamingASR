@@ -64,7 +64,7 @@ class WhisperMelExtractor(WhisperFeatureExtractor):
         raw_speech: Optional[torch.Tensor] = None,
         length: Optional[bool] = None,
         sampling_rate: Optional[int] = None,
-        do_normalize: Optional[bool] = True,
+        do_normalize: Optional[bool] = False,
         padding: Optional[str] = "longest",
         **kwargs,
     ):
