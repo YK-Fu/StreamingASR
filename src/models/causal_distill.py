@@ -132,7 +132,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
                 f"got {self.distil_scale_schedule!r}"
             )
         if loss_type == 'cosine':
-            self.distil_loss = CosineSimilarityLoss(dim=-1, scale=self.distil_loss_scale, reduction=self.cfg.distil_loss.get('reduction', 'mean'))
+            self.distil_loss = CosineSimilarityLoss(dim=1, scale=self.distil_loss_scale, reduction=self.cfg.distil_loss.get('reduction', 'mean'))
         elif loss_type == 'mse':
             self.distil_loss = MSELoss(reduction=self.cfg.distil_loss.get('reduction', 'mean'))
         else:
@@ -414,6 +414,14 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         else:
             raise ValueError(f"Invalid mode: {mode}")
         return encoded
+
+    def train(self, mode: bool = True):
+        # Parameter freezing does not disable dropout: nn.Module.train() recursively
+        # puts every child back in training mode. Keep the fixed teacher deterministic
+        # while allowing the student and trainable heads to follow the parent mode.
+        super().train(mode)
+        self.teacher.eval()
+        return self
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         logs = self.validation_pass(batch, batch_idx, dataloader_idx)
