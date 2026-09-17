@@ -297,20 +297,50 @@ class RNNTInfer:
         # TODO: Implement zombie cache killing
         return 
 
-    def decode(self, encoder_output, input_ids=None, attn_mask=None, position_ids=None, cache=None, cache_position=None):
+    def decode(
+        self,
+        encoder_output,
+        input_ids=None,
+        attn_mask=None,
+        position_ids=None,
+        cache=None,
+        cache_position=None,
+        encoded_lengths=None,
+    ):
         raise NotImplementedError("Subclass of RNNTInfer must implement the decode method")
 
 class LoopLabelRNNTInfer(RNNTInfer):
     # Higher throughput decoding strategy, but if one sample contains long silence, it will incur longer latency
-    def decode(self, encoder_output, input_ids=None, attn_mask=None, position_ids=None, cache=None, cache_position=None):
+    def decode(
+        self,
+        encoder_output,
+        input_ids=None,
+        attn_mask=None,
+        position_ids=None,
+        cache=None,
+        cache_position=None,
+        encoded_lengths=None,
+    ):
         encoder_output = encoder_output.transpose(1, 2)
         batch_size, max_time, _ = encoder_output.size()
+        if encoded_lengths is None:
+            encoded_lengths = torch.full(
+                (batch_size,), max_time, dtype=torch.long, device=encoder_output.device
+            )
+        else:
+            encoded_lengths = encoded_lengths.to(
+                device=encoder_output.device, dtype=torch.long
+            )
+            if encoded_lengths.shape != (batch_size,):
+                raise ValueError("encoded_lengths must have shape [batch]")
+            if torch.any(encoded_lengths < 1) or torch.any(encoded_lengths > max_time):
+                raise ValueError("encoded_lengths must be in [1, encoder_time]")
         if cache is None:
             input_ids, dec_out, attn_mask, position_ids, cache, cache_position = self.prefill_decoder_state(input_ids, attn_mask, position_ids, batch_size)
         else:
             assert input_ids.size(1) == 1, "input_ids should have shape (batch_size, 1)"
             dec_out = None
-        b2active = torch.ones(batch_size, device=encoder_output.device, dtype=torch.bool)
+        b2active = encoded_lengths > 0
         b2time = torch.zeros(batch_size, device=encoder_output.device, dtype=torch.int64)
         safe_time = torch.zeros(batch_size, device=encoder_output.device, dtype=torch.int64)
         hyps = [
@@ -334,17 +364,17 @@ class LoopLabelRNNTInfer(RNNTInfer):
                 # A token is written at cache_position + 1. Do not overrun the
                 # static cache, and enforce the per-frame emission cap.
                 cache_full = bool((cache_position + 1 >= self.max_length).item())
-                force_blank = symbols_added >= self.max_symbols_per_step
+                force_blank = (symbols_added >= self.max_symbols_per_step) | ~b2active
                 if cache_full:
                     force_blank.fill_(True)
                 predictions[force_blank] = self.blank_idx
                 blank_mask = predictions == self.blank_idx
-                b2time[blank_mask] += 1
+                b2time[blank_mask & b2active] += 1
 
                 # Reset symbols_added if blank token is added
                 symbols_added[blank_mask] = 0
-                b2active = b2time < max_time
-                safe_time = b2time.clamp(max=max_time - 1)
+                b2active = b2time < encoded_lengths
+                safe_time = torch.minimum(b2time, encoded_lengths - 1)
                 find_next_token_or_end = ~b2active | ~blank_mask
 
             if not blank_mask.all():
@@ -370,9 +400,30 @@ class LoopLabelRNNTInfer(RNNTInfer):
 
 class LoopFrameRNNTInfer(RNNTInfer):
     # Fixed latency decoding strategy with lower throughput and might generate more zombie cache
-    def decode(self, encoder_output, input_ids=None, attn_mask=None, position_ids=None, cache=None, cache_position=None):
+    def decode(
+        self,
+        encoder_output,
+        input_ids=None,
+        attn_mask=None,
+        position_ids=None,
+        cache=None,
+        cache_position=None,
+        encoded_lengths=None,
+    ):
         encoder_output = encoder_output.transpose(1, 2)
         batch_size, max_time, _ = encoder_output.shape
+        if encoded_lengths is None:
+            encoded_lengths = torch.full(
+                (batch_size,), max_time, dtype=torch.long, device=encoder_output.device
+            )
+        else:
+            encoded_lengths = encoded_lengths.to(
+                device=encoder_output.device, dtype=torch.long
+            )
+            if encoded_lengths.shape != (batch_size,):
+                raise ValueError("encoded_lengths must have shape [batch]")
+            if torch.any(encoded_lengths < 1) or torch.any(encoded_lengths > max_time):
+                raise ValueError("encoded_lengths must be in [1, encoder_time]")
         if cache is None:
             input_ids, dec_out, attn_mask, position_ids, cache, cache_position = self.prefill_decoder_state(input_ids, attn_mask, position_ids, batch_size)
         else:
@@ -390,25 +441,28 @@ class LoopFrameRNNTInfer(RNNTInfer):
         ]
         symbols_added = torch.zeros(batch_size, dtype=torch.int32, device=encoder_output.device)
         for t in range(max_time):
-            while True:
+            frame_active = t < encoded_lengths
+            while frame_active.any():
                 if dec_out is None:
                     dec_out = self.forward_decoder_one_step(input_ids, attn_mask, position_ids, cache, cache_position)
                 token_probs = self.joint_network(encoder_output[torch.arange(batch_size), t:t+1, :], dec_out)
                 predictions = torch.argmax(token_probs, dim=-1).reshape(batch_size)
                 cache_full = bool((cache_position + 1 >= self.max_length).item())
-                force_blank = symbols_added >= self.max_symbols_per_step
+                force_blank = (symbols_added >= self.max_symbols_per_step) | ~frame_active
                 if cache_full:
                     force_blank.fill_(True)
                 predictions[force_blank] = self.blank_idx
                 blank_mask = predictions == self.blank_idx
-                symbols_added[blank_mask] = 0
-                if blank_mask.all():
+                symbols_added[blank_mask & frame_active] = 0
+                emit_mask = frame_active & ~blank_mask
+                frame_active = emit_mask
+                if not frame_active.any():
                     break
                 else:
                     if self.decoder_runtime.decode_step is None:
                         attn_mask = F.pad(attn_mask, (0, 1), value=0)
                     for b in range(batch_size):
-                        if predictions[b] != self.blank_idx:
+                        if emit_mask[b]:
                             input_ids[b, 0] = predictions[b]
                             attn_mask[b, cache_position + 1] = 1
                             position_ids[b, 0] = position_ids[b, 0] + 1
@@ -675,6 +729,7 @@ class RNNTDecoding(ConfidenceMethodMixin):
                 input_ids = self.prepare_prompt(input_ids)
             hypotheses_list = self.decoding.decode(
                 encoder_output=encoder_output,
+                encoded_lengths=encoded_lengths,
                 input_ids=input_ids,
                 attn_mask=prompt_attention_mask,
             )  # type: [List[Hypothesis]]
