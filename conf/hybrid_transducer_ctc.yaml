@@ -1,90 +1,63 @@
-name: "Qwen-Whisper-Hybrid-Transducer-CTC"
-init_from_nemo_model: ???
+# Required overrides:
+#   init_from_nemo_model
+#   model.{train_ds,validation_ds}.manifest_filepath
+#   model.tokenizer.path
+#   model.encoder.language_file
+# Manifests are JSONL files whose audio_filepath values use
+# /path/to/shard.parquet#row=N and whose Parquet audio column contains bytes.
+name: hybrid_transducer_ctc
+init_from_nemo_model: ???  # RNN-T initialization checkpoint created by the converter.
 seed: 42
-torch_compile: true  # top-level: read by asr_train.py via cfg.get("torch_compile")
+torch_compile: false  # Enable after confirming that eager training works on your stack.
 model:
   sample_rate: 16000
-  compute_eval_loss: false # eval samples can be very long and exhaust memory. Disable computation of transducer loss during validation/testing with this flag.
-  log_prediction: true # enables logging sample predictions in the output during training
+  compute_eval_loss: false
+  log_prediction: true
   skip_nan_grad: true
-  use_cer: true
+  training_use_cer: true  # Shared by RNN-T and CTC training diagnostics.
   validation_names:
-  - zh_tw
-  - zh_cn
-  - ja
-  - ko
-  - en
-  - 'nan'
-  - hak
-  - th
-  - yue
-  - vi
-  - id
-  - ru
+    - ???
   validation_use_cer:
-  - true
-  - true
-  - true
-  - true
-  - false
-  - true
-  - true
-  - true
-  - true
-  - false
-  - false
-  - false
-  model_defaults:
-    enc_hidden: ${model.encoder.d_model}
-    pred_hidden: ${model.decoder.config.hidden_size}
-    joint_hidden: 690
-
+    - ???  # Set to false for whitespace-delimited languages where WER is preferred.
   train_ds:
-    manifest_filepath:    # Path to jsonl file containing the training data
+    manifest_filepath:
       - ???
     sample_rate: ${model.sample_rate}
     language_file: ${model.encoder.language_file}
-    # On-the-fly waveform augmentation (training only; torchaudio-based). Stacks with
-    # the spectrogram-level spec_augment below. Effects are each gated by their own
-    # `prob`; additive noise mixes random files from `noise_folders` at a target SNR (dB).
+    # Optional waveform augmentation, applied before spectrogram augmentation.
     augmentation:
-      enabled: true
+      enabled: false
       noise:
-        # Noise pool from jsonl manifest(s) with `{"audio_filepath": ...}` lines
-        # (same format as the dataset manifests). Empty -> noise disabled.
-        noise_manifests:
-          - /mnt/home/ntuspeechlabt-gmai-8b89dd/ivenfu/StreamingASR/noise/noise_manifest.jsonl
-        prob: 0.2                  # fraction of clips that get background noise
+        # Noise manifests use the same Parquet-backed JSONL format as train_ds.
+        noise_manifests: []
+        prob: 0.2
         min_snr_db: 5
         max_snr_db: 20
-      effects:                     # all off by default; raise prob to enable
-        volume:    { prob: 0.05, min_db: -10, max_db: 10 }
-        blur:      { prob: 0.05, kernel_size: 10 }
-        echo:      { prob: 0.05, delay_ms: 20, decay: 0.3 }
-        smoothing: { prob: 0.05, segment_ms: 10 }
-        pitch:     { prob: 0.03, min_semitones: -2, max_semitones: 2 }   # CPU-heavy; keep prob low
-    batch_size: 2 # you may increase batch_size if your memory allows. The actual batch size is determined by the number of GPUs and gradient accumulation steps: Actual batch size = batch_size * num_gpus * gradient_accumulation_steps
+      effects:
+        volume: {prob: 0.05, min_db: -10, max_db: 10}
+        blur: {prob: 0.05, kernel_size: 10}
+        echo: {prob: 0.05, delay_ms: 20, decay: 0.3}
+        smoothing: {prob: 0.05, segment_ms: 10}
+        pitch: {prob: 0.03, min_semitones: -2, max_semitones: 2}
+    batch_size: 2  # Increase according to available accelerator memory.
     shuffle: true
-    num_workers: 8
+    num_workers: 4
     pin_memory: true
     max_duration: 30
     min_duration: 0.1
     drop_last: true
-    text_bucket_size: 64
-    # Left-truncate manifest history to its most recent tokens. BOS, language,
-    # and current-transcript tokens are not counted toward this limit.
+    text_bucket_size: 64  # Stabilizes compiled decoder shapes when enabled.
     max_context_tokens: 256
-    audio_chunk_size: 60
+    audio_chunk_size: 30
     audio_chunk_step: 5
     bucket_by: audio
   validation_ds:
-    manifest_filepath: 
+    manifest_filepath:
       - ???
     sample_rate: ${model.sample_rate}
     language_file: ${model.encoder.language_file}
     batch_size: ${model.train_ds.batch_size}
     shuffle: false
-    use_start_end_token: false
     max_duration: ${model.train_ds.max_duration}
     min_duration: ${model.train_ds.min_duration}
     num_workers: ${model.train_ds.num_workers}
@@ -94,21 +67,18 @@ model:
     max_context_tokens: ${model.train_ds.max_context_tokens}
     bucket_by: audio
   test_ds:
-    manifest_filepath: 
-      - ???
+    manifest_filepath: null
     sample_rate: ${model.sample_rate}
     language_file: ${model.encoder.language_file}
     batch_size: ${model.train_ds.batch_size}
     max_duration: ${model.train_ds.max_duration}
     min_duration: ${model.train_ds.min_duration}
     shuffle: false
-    use_start_end_token: false
     num_workers: ${model.train_ds.num_workers}
     pin_memory: true
 
-  # You may find more detail on how to train a tokenizer at: /scripts/tokenizers/process_asr_text_tokenizer.py
   tokenizer:
-    path: ???  # path to huggingface tokenizer directory
+    path: ???  # Local Hugging Face tokenizer directory.
     blank_token: "<|endoftext|>"
 
   preprocessor:
@@ -119,29 +89,28 @@ model:
     chunk_length: 30
     n_fft: 400
     padding_value: 0.0
-    return_attention_mask: true
 
-  # Spectrogram augmentation is used to improve the robustness of the model to noise and other perturbations. Comment out if not needed.
+  # Set mask counts to zero to disable spectrogram augmentation.
   spec_augment:
     _target_: nemo.collections.asr.modules.SpectrogramAugmentation
-    freq_masks: 2 # set to zero to disable it
-    time_masks: 10 # set to zero to disable it
+    freq_masks: 2
+    time_masks: 10
     freq_width: 27
     time_width: 0.05
 
   encoder:
     _target_: src.modules.transformer_encoder.WhisperEncoder
     feat_in: ${model.preprocessor.feature_size}
-    language_files: ???
+    language_file: ???
     n_layers: 32
     d_model: 1280
     ff_expansion_factor: 4
     n_heads: 20
     pos_emb_max_len: 1500
     position_embedding_type: "alibi"
-    gradient_checkpointing: false       # Set to true to enable gradient checkpointing. This reduces the memory usage of the model.
-    freeze: false                       # Set to true to freeze the encoder.
-    freeze_ffn: false                   # Set to true to freeze the ffn network in each of the transformer blocks. This reduces the memory usage of the model.
+    gradient_checkpointing: false
+    freeze: false
+    freeze_ffn: false
     pre_encode:
       layers: [1280, 1280, 1280]
       stride: [2, 2, 2]
@@ -150,9 +119,9 @@ model:
 
   decoder:
     _target_: src.modules.transformer_decoder.LLMDecoder
-    gradient_checkpointing: false       # Set to true to enable gradient checkpointing. This reduces the memory usage of the model.
-    freeze: false                       # Set to true to freeze the decoder.
-    freeze_ffn: false                   # Set to true to freeze the ffn network in each of the transformer blocks. This reduces the memory usage of the model.
+    gradient_checkpointing: false
+    freeze: false
+    freeze_ffn: false
     config:
       _target_: transformers.Qwen2Config
       hidden_size: 896
@@ -160,23 +129,22 @@ model:
       num_hidden_layers: 24
       num_attention_heads: 14
       num_key_value_heads: 2
-      hidden_act: "silu"
+      hidden_act: silu
       max_position_embeddings: 32768
       rope_theta: 1000000
       rope_scaling: null
       attention_bias: false
       attention_dropout: 0.0
       mlp_bias: false
-      attn_implementation: "eager"
+      attn_implementation: eager
       tie_word_embeddings: true
 
-  # Dedicated projections for the pruned RNN-T smoothed loss (icefall simple_am_proj /
-  # simple_lm_proj). 
+  # Projections used to select the pruned RNN-T lattice.
   simple_am_proj:
     _target_: src.modules.projection.ProjHead
     feat_in: ${model.encoder.d_model}
-    hidden_dims: 
-     - ${model.model_defaults.joint_hidden}
+    hidden_dims:
+      - ${model.joint.jointnet.joint_hidden}
     activation: silu
     num_classes: -1
 
@@ -184,53 +152,65 @@ model:
     _target_: src.modules.projection.ProjHead
     feat_in: ${model.decoder.config.hidden_size}
     hidden_dims: []
-    activation: silu
     num_classes: -1
 
   joint:
     _target_: src.modules.projection.PrunedRNNTJoint
-    log_softmax: null  # 'null' would set it automatically according to CPU/GPU device
-    preserve_memory: false  # dramatically slows down training, but might preserve some memory
+    log_softmax: null
+    preserve_memory: false
 
-    # Fuses the computation of prediction net + joint net + loss + WER calculation
-    fuse_loss_wer: true   # always set to true
-    fused_batch_size: ${model.train_ds.batch_size}  # Do not change this value, I do not implement memory efficient joint step
+    fuse_loss_wer: true
+    fused_batch_size: ${model.train_ds.batch_size}
 
     jointnet:
-      joint_hidden: ${model.model_defaults.joint_hidden}
-      activation: "silu"
-      dropout: 0.2
+      joint_hidden: 690
+      activation: silu
+      dropout: 0.05
 
   decoding:
-    strategy: "LoopLabel" # Choose between LoopLabel and LoopFrame
-    max_length: 128
+    strategy: LoopLabel
+    max_length: 128  # Total decoder-cache budget: prompt plus emitted tokens.
+    prefill_bucket_size: 64
     max_symbols_per_step: 3
-
-    # greedy strategy config
-    greedy:
-      max_symbols: 128
   aux_llm:
     llm_loss_weight: 0.1
 
-  # The section which would contain the decoder and decoding configs of the auxiliary CTC decoder
+  # Predictor-context augmentation. The CTC ratio is sampled per utterance;
+  # optional manual deletion is applied afterward to either the selected CTC
+  # history or the clean history. RNN-T, LM, and CTC targets always stay clean.
+  token_augmentation:
+    ctc_history:
+      enabled: false
+      sample_ratio: 0.0
+      warmup_steps: 3000
+      ramp_steps: 2000
+    context_deletion:
+      enabled: false
+      probability: 0.0
+
+  # Auxiliary CTC objective used jointly with the RNN-T loss.
   aux_ctc:
-    ctc_loss_weight: 0.3 # the weight used to combine the CTC loss with the RNNT loss
-    use_cer: true
+    ctc_loss_weight: 0.3
     decoder:
       _target_: src.modules.projection.ProjHead
       feat_in: ${model.encoder.d_model}
-      hidden_dims: 
-        - ${model.model_defaults.joint_hidden}  # two-layer head matching joiner's (project_encoder, final) structure
+      hidden_dims:
+        - ${model.joint.jointnet.joint_hidden}
       activation: silu
       num_classes: -1
     decoding:
-      strategy: "greedy_batch"    # "greedy", "greedy_batch", "beam", "pyctcdecode", "flashlight", "wfst", 
+      strategy: greedy_batch
 
-  # config for InterCTC loss: https://arxiv.org/abs/2102.03216
-  # specify loss weights and which layers to use for InterCTC
-  # e.g., to reproduce the paper results, set loss_weights: [0.3]
-  # and apply_at_layers: [8] (assuming 18 layers). Note that final
-  # layer loss coefficient is automatically adjusted (to 0.7 in above example)
+  # CTC-guided frame reduction for the RNN-T path. CTC itself continues to use
+  # the full encoder sequence. Disable this block to recover the legacy path.
+  ctc_pruning:
+    frame:
+      enabled: true
+      blank_threshold: 0.95
+      lconv_kernel_size: 7
+      lconv_expansion: 2
+
+  # Optional intermediate CTC supervision.
   interctc:
     loss_weights: []
     apply_at_layers: []
@@ -238,64 +218,64 @@ model:
   loss:
     lm_only_scale: 0.25
     am_only_scale: 0.0
-    delay_penalty: 0.05    # keep at 0 until model converges; icefall disables during warmup
-    s_range: 4            # pruned RNN-T loss: how many symbols to keep for each frame. (reduce a lot of memory and training time)
-    loss_warm_steps: 5000 # steps to ramp rnnt_loss_weight 0.1→1.0, decoupled from LR warmup
+    delay_penalty: 0.0
+    fastemit_lambda: 0.008  # Nonblank gradients are scaled by 1 + this value.
+    s_range: 4
+    loss_warm_steps: 3000
 
   optim:
     name: adamw_8bit
     lr: 1e-4
     eps: 1e-8
-    # optimizer arguments
-    betas: [ 0.9, 0.98 ]
+    betas: [0.9, 0.98]
     weight_decay: 1e-3
 
-    # scheduler setup
     sched:
       name: CosineAnnealing
-      max_steps: 1000000
+      max_steps: 100000
       min_lr: 1e-6
-      # Scheduler params
-      warmup_steps: 100000
+      warmup_steps: 5000
       warmup_ratio: null
 
 trainer:
-  devices: 1 # number of GPUs, -1 would use all available GPUs
+  devices: 1
   num_nodes: 1
-  max_epochs: 500
-  max_steps: -1 # computed at runtime if not set
-  val_check_interval: 0.25 # Set to 0.25 to check 4 times per epoch, or an int for number of iterations
+  max_epochs: -1
+  max_steps: ${model.optim.sched.max_steps}
+  val_check_interval: 5000
   accelerator: auto
-  strategy: ddp
-  accumulate_grad_batches: 32
+  strategy: auto
+  accumulate_grad_batches: 1
   gradient_clip_val: 1.0
-  precision: bf16 # 16, 32, or bf16. Strongly recommended to use bf16 for training. fp16 might cause numerical instability.
-  log_every_n_steps: 1000  # Interval of logging.
-  enable_progress_bar: True
-  num_sanity_val_steps: 2 # number of steps to perform validation steps for sanity check the validation process before starting the training, setting to 0 disables it
-  check_val_every_n_epoch: 1 # number of evaluations on validation every n epochs
+  precision: bf16
+  log_every_n_steps: 100
+  enable_progress_bar: true
+  num_sanity_val_steps: 2
+  check_val_every_n_epoch: null
   limit_val_batches: 1.0
-  sync_batchnorm: true
-  enable_checkpointing: false  # Provided by exp_manager
-  logger: false  # Provided by exp_manager
-  benchmark: false # needs to be false for models with variable-length speech input as it slows down training
+  sync_batchnorm: false
+  enable_checkpointing: false  # Managed by exp_manager.
+  logger: false  # Managed by exp_manager.
+  benchmark: false
 
 
 exp_manager:
-  exp_dir: "exp"
+  exp_dir: experiments
   name: ${name}
   create_tensorboard_logger: true
   create_checkpoint_callback: true
   checkpoint_callback_params:
-    # in case of multiple validation sets, first one is used
-    monitor: "val_wer"
-    mode: "min"
+    monitor: val_wer
+    mode: min
     save_top_k: 5
-    always_save_nemo: True # saves the checkpoints as nemo files instead of PTL checkpoints
-  resume_if_exists: True
-  resume_ignore_no_checkpoint: True
+    always_save_nemo: true
+    every_n_train_steps: 5000
+    every_n_epochs: 0
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
 
+  # Disabled by default so the template never requires external credentials.
   create_wandb_logger: false
   wandb_logger_kwargs:
-    name: null
-    project: null
+    name: ${name}
+    project: null  # Set when create_wandb_logger=true.

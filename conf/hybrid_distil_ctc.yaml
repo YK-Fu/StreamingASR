@@ -1,79 +1,58 @@
-name: "Whisper-Causal-Distil-CTC"
-init_from_nemo_model: ???
+# Required overrides:
+#   init_from_nemo_model
+#   model.{train_ds,validation_ds}.manifest_filepath
+#   model.tokenizer.path
+#   model.student.language_file
+# Manifests are JSONL files whose audio_filepath values use
+# /path/to/shard.parquet#row=N and whose Parquet audio column contains bytes.
+name: hybrid_distil_ctc
+init_from_nemo_model: ???  # Initial .nemo checkpoint containing teacher/student weights.
 seed: 42
 torch_compile: true
 
 model:
   sample_rate: 16000
-  compute_eval_loss: false # eval samples can be very long and exhaust memory. Disable computation of transducer loss during validation/testing with this flag.
-  log_prediction: true # enables logging sample predictions in the output during training
+  compute_eval_loss: false
+  log_prediction: true
   skip_nan_grad: true
-  use_cer: true
+  training_use_cer: true  # Metric used for periodic training-batch diagnostics.
   validation_names:
-    - zh_tw
-    - zh_cn
-    - ja
-    - ko
-    - en
-    - nan
-    - hak
-    - th
-    - yue
-    - vi
-    - id
-    - ru
+    - ???
   validation_use_cer:
-    - true
-    - true
-    - true
-    - true
-    - false
-    - true
-    - true
-    - true
-    - true
-    - false
-    - false
-    - false
-  model_defaults:
-    enc_hidden: ${model.student.d_model}
-    # Hidden dim of the two-layer CTC head. Set to match the RNN-T joint_hidden in
-    # hybrid_transducer_ctc.yaml so distill CTC weights transfer cleanly at conversion.
-    ctc_hidden: 690
-
+    - ???  # Set to false for whitespace-delimited languages where WER is preferred.
   train_ds:
-    manifest_filepath:    # Path to jsonl file containing the training data
-      - /localhome/local-ifu/streaming_asr/train_clean_100.json
+    manifest_filepath:
+      - ???
     sample_rate: ${model.sample_rate}
-    language_drop_rate: 0.2
+    language_drop_rate: 0.0
     language_file: ${model.student.language_file}
-    never_drop_language:
-      - <|ZH_SIM|>
-    batch_size: 2 # you may increase batch_size if your memory allows. The actual batch size is determined by the number of GPUs and gradient accumulation steps: Actual batch size = batch_size * num_gpus * gradient_accumulation_steps
+    never_drop_language: []
+    batch_size: 2  # Increase according to available accelerator memory.
     shuffle: true
-    num_workers: 16
+    num_workers: 4
     pin_memory: true
-    max_duration: 30 # it is set for LibriSpeech, you may need to update it for your dataset
+    max_duration: 30
     min_duration: 0.1
     drop_last: true
-    audio_chunk_size: 30  # maximum audio length in seconds; audio longer than this is truncated
-    audio_chunk_step: 30   # pad each batch to the next multiple of this value (seconds), up to audio_chunk_size
-    bucket_by: "audio"  # Bucket by 'audio' or 'text' length for efficient batching
+    # Distillation uses a fixed 30-second input to match Whisper positional embeddings.
+    audio_chunk_size: 30
+    audio_chunk_step: 30
+    bucket_by: audio
 
   validation_ds:
-    manifest_filepath: /localhome/local-ifu/streaming_asr/dev_clean.json
+    manifest_filepath:
+      - ???
     sample_rate: ${model.sample_rate}
     language_file: ${model.student.language_file}
     batch_size: ${model.train_ds.batch_size}
     shuffle: false
-    use_start_end_token: false
     max_duration: ${model.train_ds.max_duration}
     min_duration: ${model.train_ds.min_duration}
-    num_workers: 16
+    num_workers: ${model.train_ds.num_workers}
     pin_memory: true
     audio_chunk_size: 30
     audio_chunk_step: 30
-    bucket_by: "audio"
+    bucket_by: audio
 
   test_ds:
     manifest_filepath: null
@@ -83,13 +62,11 @@ model:
     max_duration: ${model.train_ds.max_duration}
     min_duration: ${model.train_ds.min_duration}
     shuffle: false
-    use_start_end_token: false
-    num_workers: 16
+    num_workers: ${model.train_ds.num_workers}
     pin_memory: true
 
-  # You may find more detail on how to train a tokenizer at: /scripts/tokenizers/process_asr_text_tokenizer.py
   tokenizer:
-    path: ???  # path to huggingface tokenizer directory
+    path: ???  # Local Hugging Face tokenizer directory.
     blank_token: "<|endoftext|>"
 
   preprocessor:
@@ -100,13 +77,12 @@ model:
     chunk_length: 30
     n_fft: 400
     padding_value: 0.0
-    return_attention_mask: true
 
-  # Spectrogram augmentation is used to improve the robustness of the model to noise and other perturbations. Comment out if not needed.
+  # Set mask counts to zero to disable spectrogram augmentation.
   spec_augment:
     _target_: nemo.collections.asr.modules.SpectrogramAugmentation
-    freq_masks: 2 # set to zero to disable it
-    time_masks: 10 # set to zero to disable it
+    freq_masks: 2
+    time_masks: 10
     freq_width: 27
     time_width: 0.05
 
@@ -116,12 +92,10 @@ model:
     n_layers: 32
     d_model: 1280
     ff_expansion_factor: 4
-    n_heads: 20  # Whisper-large has 20 attention heads
+    n_heads: 20
     pos_emb_max_len: 1500
     position_embedding_type: "learned"
     gradient_checkpointing: false
-    freeze: true
-    freeze_ffn: false
     pre_encode:
       layers: [1280, 1280]
       stride: [1, 2]
@@ -139,7 +113,6 @@ model:
     pos_emb_max_len: 1500
     position_embedding_type: "alibi"
     gradient_checkpointing: false
-    freeze: false
     freeze_ffn: false
     pre_encode:
       layers: [1280, 1280, 1280]
@@ -148,88 +121,87 @@ model:
       activation: gelu
 
   distil_loss:
-    type: "cosine"
-    reduction: "mean"
-    scale: 100.0
+    type: cosine
+    reduction: mean
+    scale: 30.0
+    # Select constant or linear_decay. The decay fields are required only for
+    # linear_decay and intentionally remain null in this constant-loss template.
+    scale_schedule: constant
+    final_scale: 0.0
+    decay_start_step: null
+    decay_end_step: null
     projector_activation: gelu
-  # The section which would contain the decoder and decoding configs of the auxiliary CTC decoder
+  # Auxiliary CTC objective retained in the converted RNN-T checkpoint.
   aux_ctc:
-    ctc_loss_weight: 0.5 # the weight used to combine the CTC loss with the distil loss
-    use_cer: true
+    ctc_loss_weight: 0.5
     decoder:
       _target_: src.modules.projection.ProjHead
       feat_in: ${model.student.d_model}
-      hidden_dims: 
-        - ${model.model_defaults.ctc_hidden}  # match RNN-T joint_hidden for clean weight transfer at conversion
+      hidden_dims:
+        # Must match model.joint.jointnet.joint_hidden in the RNN-T config so the
+        # trained CTC head can initialize the joiner during checkpoint conversion.
+        - 690
       activation: silu
       num_classes: -1
     decoding:
-      strategy: "greedy_batch"    # "greedy", "greedy_batch", "beam", "pyctcdecode", "flashlight", "wfst", 
+      strategy: greedy_batch
 
-  # config for InterCTC loss: https://arxiv.org/abs/2102.03216
-  # specify loss weights and which layers to use for InterCTC
-  # e.g., to reproduce the paper results, set loss_weights: [0.3]
-  # and apply_at_layers: [8] (assuming 18 layers). Note that final
-  # layer loss coefficient is automatically adjusted (to 0.7 in above example)
+  # Optional intermediate CTC supervision.
   interctc:
     loss_weights: []
     apply_at_layers: []
 
   optim:
     name: adamw_8bit
-    lr: 1e-3
+    lr: 1e-4
     eps: 1e-06
-    # optimizer arguments
-    betas: [ 0.9, 0.98 ]
+    betas: [0.9, 0.98]
     weight_decay: 1e-3
 
-    # scheduler setup
     sched:
-      name: CosineAnnealing
-      max_steps: 1000000
-      min_lr: 1e-6
-      # Scheduler params
-      warmup_steps: 5000
+      name: WarmupPolicy
+      max_steps: 20000
+      warmup_steps: 1000
       warmup_ratio: null
 
 trainer:
-  devices: 1 # number of GPUs, -1 would use all available GPUs
+  devices: 1
   num_nodes: 1
-  max_epochs: 500
-  max_steps: -1 # computed at runtime if not set
-  val_check_interval: 1.0 # Set to 0.25 to check 4 times per epoch, or an int for number of iterations
+  max_epochs: -1
+  max_steps: ${model.optim.sched.max_steps}
+  val_check_interval: 5000
   accelerator: auto
-  strategy: ddp
-  accumulate_grad_batches: 8
+  strategy: auto
+  accumulate_grad_batches: 1
   gradient_clip_val: 1.0
-  precision: bf16 # 16, 32, or bf16. Strongly recommended to use bf16 for training. fp16 might cause numerical instability.
-  log_every_n_steps: 500  # Interval of logging.
-  enable_progress_bar: True
-  num_sanity_val_steps: 0 # number of steps to perform validation steps for sanity check the validation process before starting the training, setting to 0 disables it
-  check_val_every_n_epoch: 1 # number of evaluations on validation every n epochs
-  sync_batchnorm: true
-  enable_checkpointing: false  # Provided by exp_manager
-  logger: false  # Provided by exp_manager
-  benchmark: false # needs to be false for models with variable-length speech input as it slows down training
+  precision: bf16
+  log_every_n_steps: 1000
+  enable_progress_bar: true
+  num_sanity_val_steps: 2
+  check_val_every_n_epoch: null
+  sync_batchnorm: false
+  enable_checkpointing: false  # Managed by exp_manager.
+  logger: false  # Managed by exp_manager.
+  benchmark: false
 
 
 exp_manager:
-  exp_dir: "exp"
+  exp_dir: exp
   name: ${name}
   create_tensorboard_logger: true
   create_checkpoint_callback: true
   checkpoint_callback_params:
-    # in case of multiple validation sets, first one is used
-    monitor: "val_wer_ctc"
-    mode: "min"
-    save_top_k: 5
-    always_save_nemo: True # saves the checkpoints as nemo files instead of PTL checkpoints
-    every_n_train_steps: 2000
+    monitor: val_wer_ctc
+    mode: min
+    save_top_k: 3
+    always_save_nemo: true
+    every_n_train_steps: 5000
     every_n_epochs: 0
-  resume_if_exists: True
-  resume_ignore_no_checkpoint: True
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
 
+  # Disabled by default so the template never requires external credentials.
   create_wandb_logger: false
   wandb_logger_kwargs:
-    name: null
-    project: null
+    name: ${name}
+    project: null  # Set when create_wandb_logger=true.
