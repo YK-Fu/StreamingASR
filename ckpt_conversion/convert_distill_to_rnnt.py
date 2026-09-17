@@ -5,8 +5,10 @@ Convert a trained CausalWhisperDistilModel checkpoint to HybridRNNTCTCWhisperLMM
 This script takes the distillation model (with trained student encoder) and creates
 a full RNNT model by:
 1. Copying student encoder weights to the RNNT encoder
-2. Optionally copying CTC decoder weights
-3. Initializing the Qwen decoder from HuggingFace (or leaving random)
+2. Copying the trained CTC decoder weights
+3. Initializing the Qwen decoder from HuggingFace
+4. Seeding the joiner/simple-AM from CTC and simple-LM from Qwen
+5. Creating an identity-initialized causal LConv for frame pruning
 
 Usage examples:
     # Convert distill model to RNNT, initialize decoder from HF Qwen
@@ -184,33 +186,29 @@ def load_distill_weights_to_rnnt(distill_state, model):
             new_key = _strip_orig_mod(key[len("ctc_decoder."):])
             ctc_decoder_state[new_key] = value
 
-    if ctc_decoder_state:
-        print(f"CTC decoder keys: {len(ctc_decoder_state)}")
-        # Filter out shape-mismatched keys before load_state_dict — strict=False handles
-        # missing/unexpected keys but still raises on size mismatch for matched keys.
-        # This makes the transfer robust across ProjHead shape changes (e.g. legacy
-        # SimpleProj decoder_layers shape (V, enc_dim) → new ProjHead with hidden_dims
-        # of a different size).
-        target_state = model.ctc_decoder.state_dict()
-        filtered_state = {}
-        shape_mismatched = []
-        for k, v in ctc_decoder_state.items():
-            if k in target_state and target_state[k].shape != v.shape:
-                shape_mismatched.append((k, tuple(v.shape), tuple(target_state[k].shape)))
-            else:
-                filtered_state[k] = v
-        if shape_mismatched:
-            print("  WARNING: shape-mismatched keys (kept at random init):")
-            for k, src_shape, dst_shape in shape_mismatched[:5]:
-                print(f"    {k}: src {src_shape} -> dst {dst_shape}")
-        missing, unexpected = model.ctc_decoder.load_state_dict(filtered_state, strict=False)
-        if missing:
-            print(f"  Missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Missing keys: {missing}")
-        if unexpected:
-            print(f"  Unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Unexpected keys: {unexpected}")
-        print(f"  CTC decoder weights loaded ({len(filtered_state)}/{len(ctc_decoder_state)} keys transferred)")
-    else:
-        print("  No CTC decoder weights found in distillation checkpoint")
+    if not ctc_decoder_state:
+        raise RuntimeError(
+            "The distillation checkpoint has no CTC decoder; canonical RNN-T "
+            "initialization requires the trained CTC head."
+        )
+
+    print(f"CTC decoder keys: {len(ctc_decoder_state)}")
+    target_state = model.ctc_decoder.state_dict()
+    missing = sorted(set(target_state) - set(ctc_decoder_state))
+    unexpected = sorted(set(ctc_decoder_state) - set(target_state))
+    mismatched = sorted(
+        (key, tuple(ctc_decoder_state[key].shape), tuple(target_state[key].shape))
+        for key in set(target_state) & set(ctc_decoder_state)
+        if target_state[key].shape != ctc_decoder_state[key].shape
+    )
+    if missing or unexpected or mismatched:
+        raise RuntimeError(
+            "The distilled and canonical CTC heads are incompatible: "
+            f"missing={missing[:5]}, unexpected={unexpected[:5]}, "
+            f"mismatched={mismatched[:5]}"
+        )
+    model.ctc_decoder.load_state_dict(ctc_decoder_state, strict=True)
+    print(f"  CTC decoder weights loaded ({len(ctc_decoder_state)} tensors)")
 
 
 def init_joint_from_ctc(model):
@@ -401,14 +399,11 @@ def load_qwen_decoder_weights(qwen_path, model):
         print(f"  Decoder unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Decoder unexpected keys: {unexpected}")
     print("  Decoder + native lm_head weights loaded successfully")
 
-    # --- Dedicated pruned-RNN-T simple projections: left at __init__ random init here.
-    # simple_am_proj / simple_lm_proj are icefall-style; with --init-joint-from-ctc they
-    # are subsequently initialized from the CTC head and the LM head respectively (see
-    # init_joint_from_ctc, which runs after this). Otherwise they stay at the configured
-    # simple_proj.init_scale random init and the loss-warmup phase trains them. ---
+    # The dedicated pruning projections are seeded after both CTC and Qwen
+    # weights have been loaded; see init_joint_from_ctc().
     for name in ("simple_am_proj", "simple_lm_proj"):
         if getattr(model, name, None) is not None:
-            print(f"  {name}: kept at __init__ random init for now (use --init-joint-from-ctc to seed from CTC/LM head)")
+            print(f"  {name}: will be seeded from its trained head")
 
 
 def main():
@@ -442,12 +437,12 @@ def main():
         help="Output path for the RNNT .nemo checkpoint"
     )
     
-    # Optional Qwen initialization
+    # Qwen initialization
     parser.add_argument(
         "--qwen",
         type=str,
         required=True,
-        help="HuggingFace Qwen model path for decoder initialization (optional)"
+        help="HuggingFace Qwen model path for decoder initialization"
     )
 
     parser.add_argument(
@@ -462,15 +457,6 @@ def main():
         type=str,
         default=None,
         help="Override model.encoder.language_file from the RNN-T config",
-    )
-
-    parser.add_argument(
-        "--init-joint-from-ctc",
-        action="store_true",
-        help="Initialize the joint's final classifier from the CTC head and "
-             "zero-init project_prednet. Requires joint_hidden == encoder.d_model "
-             "so project_encoder is an Identity. Makes the RNN-T behave approximately "
-             "like CTC at step 0 — a much better starting point than random init."
     )
 
     args = parser.parse_args()
@@ -514,16 +500,20 @@ def main():
     # Load Qwen decoder
     load_qwen_decoder_weights(args.qwen, model)
 
-    # Optionally initialize joint from CTC head (must happen AFTER ctc_decoder
-    # is loaded; it reads ctc_decoder.decoder_layers.weight).
-    if args.init_joint_from_ctc:
-        init_joint_from_ctc(model)
+    # Seed the joiner and simple projections after both trained heads are loaded.
+    # This is the sole supported RNN-T initialization recipe.
+    init_joint_from_ctc(model)
+
+    if torch.count_nonzero(model.lconv.out_proj.weight).item() != 0:
+        raise RuntimeError("LConv output projection is not identity-initialized")
+    if torch.count_nonzero(model.lconv.out_proj.bias).item() != 0:
+        raise RuntimeError("LConv output bias is not identity-initialized")
 
     # Save the model
     model.save_to(args.output)
     
     # Print summary
-    encoder_total_params = sum(p.numel() for p in model.encoder.parameters()) + sum(p.numel() for p in model.ctc_decoder.parameters()) + sum(p.numel() for p in model.simple_am_proj.parameters())
+    encoder_total_params = sum(p.numel() for p in model.encoder.parameters()) + sum(p.numel() for p in model.ctc_decoder.parameters()) + sum(p.numel() for p in model.simple_am_proj.parameters()) + sum(p.numel() for p in model.lconv.parameters())
     decoder_total_params = sum(p.numel() for p in model.decoder.parameters()) + sum(p.numel() for p in model.simple_lm_proj.parameters())
     joiner_total_params = sum(p.numel() for p in model.joint.parameters())
     

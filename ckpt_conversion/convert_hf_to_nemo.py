@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Convert HuggingFace Whisper encoder and Qwen decoder checkpoints to NeMo format.
+Convert a HuggingFace Whisper checkpoint to the distillation NeMo format.
 
-This script converts:
-- Whisper encoder -> WhisperEncoder (for distillation teacher or custom encoder)
-- Qwen model -> LLMDecoder (for RNNT predictor)
-
-Supports word embedding tie/untie for Qwen.
+This script initializes the Whisper teacher and student encoders used before
+distillation. RNN-T initialization is intentionally handled only by
+``convert_distill_to_rnnt.py`` after distillation has produced a trained CTC
+student.
 
 The script instantiates the actual NeMo models and uses model.save_to() to create
 proper .nemo files (tarball with config + weights).
@@ -14,7 +13,7 @@ proper .nemo files (tarball with config + weights).
 
 import argparse
 import torch
-from typing import Dict, Optional
+from typing import Dict
 from collections import OrderedDict
 from omegaconf import OmegaConf, open_dict
 
@@ -246,99 +245,6 @@ def init_extra_subsampling_convs_as_downsample(encoder, num_whisper_convs: int =
               f"no extra downsample convs to initialize")
 
 
-def convert_qwen_decoder_weights(
-    hf_model_path: str,
-    vocab_size: int,
-) -> Dict[str, torch.Tensor]:
-    """
-    Convert HuggingFace Qwen to LLMDecoder.prediction state_dict.
-
-    LLMDecoder now wraps AutoModelForCausalLM (Qwen2ForCausalLM), so the HF state_dict
-    maps 1:1 — keep the "model." prefix and the native "lm_head.weight". The embedding
-    and lm_head rows are trimmed to vocab_size. The lm_head<->embedding tie is handled
-    by the model itself via config.tie_word_embeddings (for tied models lm_head.weight
-    may be absent from the state_dict; strict=False at load time handles that).
-
-    Architecture mapping:
-        HF Qwen2ForCausalLM          -> LLMDecoder.prediction (Qwen2ForCausalLM)
-        ----------------------------------------------------------------
-        model.embed_tokens.weight    -> model.embed_tokens.weight (trimmed)
-        model.layers[i].*            -> model.layers[i].*
-        model.norm.weight            -> model.norm.weight
-        lm_head.weight               -> lm_head.weight (trimmed; absent if tied)
-
-    Args:
-        hf_model_path: Path or HuggingFace model name (e.g., "Qwen/Qwen2.5-0.5B")
-        vocab_size: Vocabulary size (the HF Qwen vocab is usually larger; rows are trimmed)
-
-    Returns:
-        decoder_state_dict for model.decoder.prediction
-    """
-    from transformers import AutoModelForCausalLM
-
-    print(f"Loading Qwen model from {hf_model_path}...")
-    hf_model = AutoModelForCausalLM.from_pretrained(hf_model_path, trust_remote_code=True)
-    hf_state = hf_model.state_dict()
-
-    converted = OrderedDict()
-    for key, value in hf_state.items():
-        # Trim the vocab dimension of the embedding and the (untied) lm_head.
-        if 'embed_tokens' in key or key == 'lm_head.weight':
-            value = value[:vocab_size]
-        converted[key] = value
-
-    print(f"Qwen decoder conversion complete. Total keys: {len(converted)}")
-    return converted
-
-
-def create_rnnt_model_checkpoint(whisper_path, qwen_path, model):
-    # Validate config before conversion
-    validate_whisper_config(whisper_path, model.cfg.encoder)
-
-    # Convert and load encoder weights
-    print(f"\n=== Converting Whisper encoder ===")
-    encoder_state = convert_whisper_encoder_weights(
-        whisper_path,
-        include_position_embeddings=model.cfg.encoder.get("position_embedding_type", "alibi") == "learned"
-    )
-
-    # Load encoder weights
-    missing, unexpected = model.encoder.load_state_dict(encoder_state, strict=False)
-    if missing:
-        print(f"  Encoder missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Encoder missing keys: {missing}")
-    if unexpected:
-        print(f"  Encoder unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Encoder unexpected keys: {unexpected}")
-    # Extra subsampling convs (beyond Whisper's 2) -> identity-downsample init.
-    init_extra_subsampling_convs_as_downsample(model.encoder)
-    print(f"  Encoder weights loaded successfully")
-    
-    # Convert and load decoder weights (incl. native lm_head) into decoder.prediction
-    # (Qwen2ForCausalLM). The lm_head<->embedding tie is handled by the model via
-    # config.tie_word_embeddings.
-    print(f"\n=== Converting Qwen decoder (ForCausalLM) ===")
-    decoder_state = convert_qwen_decoder_weights(
-        qwen_path,
-        vocab_size=model.tokenizer.vocab_size,
-    )
-
-    missing, unexpected = model.decoder.prediction.load_state_dict(decoder_state, strict=False)
-    # `lm_head.weight` legitimately appears as a missing key when the model ties it to
-    # the embedding (tie_word_embeddings=True) — it shares embed_tokens.weight.
-    if missing:
-        print(f"  Decoder missing keys: {missing[:5]}..." if len(missing) > 5 else f"  Decoder missing keys: {missing}")
-    if unexpected:
-        print(f"  Decoder unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"  Decoder unexpected keys: {unexpected}")
-    print(f"  Decoder + native lm_head weights loaded successfully")
-
-    # --- Dedicated pruned-RNN-T simple projections: kept at RANDOM init ---
-    # simple_am_proj / simple_lm_proj (icefall-style, untied from the CTC and LM heads)
-    # are already randomly initialized by the model __init__ using the configured
-    # simple_proj.init_scale. They are NOT loaded from Qwen.
-    for name in ("simple_am_proj", "simple_lm_proj"):
-        if getattr(model, name, None) is not None:
-            print(f"  {name}: kept at __init__ random init (config simple_proj.init_scale); NOT loaded from Qwen")
-
-
 def create_distill_model_checkpoint(whisper_path, model):
     # Validate teacher config before conversion
     validate_whisper_config(whisper_path, model.cfg.teacher)
@@ -380,7 +286,7 @@ def create_distill_model_checkpoint(whisper_path, model):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert HuggingFace Whisper/Qwen checkpoints to NeMo format",
+        description="Convert HuggingFace Whisper to the distillation NeMo format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -392,19 +298,12 @@ def main():
         default=None,
         help="HuggingFace Whisper model path or name (e.g., openai/whisper-small)"
     )
-    parser.add_argument(
-        "--qwen",
-        type=str,
-        default=None,
-        help="HuggingFace Qwen model path or name (e.g., Qwen/Qwen2.5-0.5B)"
-    )
-    
     # Config file (required for proper NeMo format)
     parser.add_argument(
         "--config", "-c",
         type=str,
         required=True,
-        help="Path to YAML config file (e.g., conf/hybrid_transducer_ctc.yaml)"
+        help="Path to the distillation YAML config"
     )
     
     # Output arguments
@@ -434,43 +333,25 @@ def main():
     # builds initialize MPI while creating it, which makes an otherwise CPU-only,
     # single-process conversion depend on host MPI networking.
     dummy_trainer = None
-    # Validate arguments
-    if config.model.get("teacher", None) is not None:
-        if args.whisper is None:
-            parser.error("--whisper is required for distillation")
-
-        from src.models.causal_distill import CausalWhisperDistilModel
-        model = CausalWhisperDistilModel(cfg=config.model, trainer=dummy_trainer)
-        create_distill_model_checkpoint(
-            whisper_path=args.whisper,
-            model=model
+    if config.model.get("teacher", None) is None:
+        parser.error(
+            "convert_hf_to_nemo.py only creates distillation checkpoints; "
+            "use convert_distill_to_rnnt.py for RNN-T initialization"
         )
-        teacher_total_params = sum(p.numel() for p in model.teacher.parameters())
-        student_total_params = sum(p.numel() for p in model.student.parameters()) + sum(p.numel() for p in model.ctc_decoder.parameters())
-        print(f"\n=== Summary ===")
-        print(f"  Teacher total parameters: {teacher_total_params:,}")
-        print(f"  Student total parameters: {student_total_params:,}")
-        
-    else:
-        if args.whisper is None:
-            parser.error("--whisper is required for rnnt model")
-        if args.qwen is None:
-            parser.error("--qwen is required for rnnt model")
+    if args.whisper is None:
+        parser.error("--whisper is required for distillation")
 
-        from src.models.rnnt_model import HybridRNNTCTCWhisperLMModel
-        model = HybridRNNTCTCWhisperLMModel(cfg=config.model, trainer=dummy_trainer)
-        create_rnnt_model_checkpoint(
-            whisper_path=args.whisper,
-            qwen_path=args.qwen,
-            model=model
-        )
-        encoder_total_params = sum(p.numel() for p in model.encoder.parameters()) + sum(p.numel() for p in model.ctc_decoder.parameters()) + sum(p.numel() for p in model.simple_am_proj.parameters())
-        decoder_total_params = sum(p.numel() for p in model.decoder.parameters()) + sum(p.numel() for p in model.simple_lm_proj.parameters())
-        joiner_total_params = sum(p.numel() for p in model.joint.parameters())
-        print(f"\n=== Summary ===")
-        print(f"  Encoder total parameters: {encoder_total_params:,}")
-        print(f"  Decoder total parameters: {decoder_total_params:,}")
-        print(f"  Joiner total parameters: {joiner_total_params:,}")
+    from src.models.causal_distill import CausalWhisperDistilModel
+    model = CausalWhisperDistilModel(cfg=config.model, trainer=dummy_trainer)
+    create_distill_model_checkpoint(
+        whisper_path=args.whisper,
+        model=model
+    )
+    teacher_total_params = sum(p.numel() for p in model.teacher.parameters())
+    student_total_params = sum(p.numel() for p in model.student.parameters()) + sum(p.numel() for p in model.ctc_decoder.parameters())
+    print(f"\n=== Summary ===")
+    print(f"  Teacher total parameters: {teacher_total_params:,}")
+    print(f"  Student total parameters: {student_total_params:,}")
     model.save_to(args.output)
     print(f"  Output: {args.output}")
     print("=" * 60)
