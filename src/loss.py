@@ -224,8 +224,8 @@ class MSELoss(nn.MSELoss, Serialization, Typing):
         """Input types definitions for MSELoss.
         """
         return {
-            "x": NeuralType(('B, T, D'), LogprobsType()),
-            "y": NeuralType(('B, T, D'), LogprobsType()),
+            "x": NeuralType(('B', 'D', 'T'), LogprobsType()),
+            "y": NeuralType(('B', 'D', 'T'), LogprobsType()),
         }
     @property
     def output_types(self):
@@ -236,19 +236,18 @@ class MSELoss(nn.MSELoss, Serialization, Typing):
         """Forward pass for MSELoss.
         """
         loss = super().forward(x, y)
-        b, t = loss.shape
         if self.finegrained_reduction == 'mean':
-            loss = loss / (b * t)
+            loss = loss.mean()
         elif self.finegrained_reduction == 'sum':
-            loss = loss
+            loss = loss.sum()
         elif self.finegrained_reduction == 'mean_batch':
-            loss = loss / b
+            loss = loss.sum() / loss.shape[0]
         else:
             raise ValueError(f"Invalid reduction: {self.finegrained_reduction}")
         return loss
 
 class CosineSimilarityLoss(nn.CosineSimilarity, Serialization, Typing):
-    def __init__(self, dim=-1, scale=1000.0, reduction='mean', **kwargs):
+    def __init__(self, dim=1, scale=1000.0, reduction='mean', **kwargs):
         super().__init__(dim=dim, **kwargs)
         self.finegrained_reduction = reduction
         self.scale = scale if scale < 0 else -1 * scale
@@ -258,8 +257,8 @@ class CosineSimilarityLoss(nn.CosineSimilarity, Serialization, Typing):
         """Input types definitions for CosineSimilarityLoss.
         """
         return {
-            "x": NeuralType(('B, T, D'), LogprobsType()),
-            "y": NeuralType(('B, T, D'), LogprobsType()),
+            "x": NeuralType(('B', 'D', 'T'), LogprobsType()),
+            "y": NeuralType(('B', 'D', 'T'), LogprobsType()),
         }
     @property
     def output_types(self):
@@ -272,14 +271,18 @@ class CosineSimilarityLoss(nn.CosineSimilarity, Serialization, Typing):
     def forward(self, x, y):
         """Forward pass for CosineSimilarityLoss.
         """
-        loss = super().forward(x, y).sum() * self.scale
-        b, t, _ = x.shape
+        if x.ndim != 3 or y.shape != x.shape:
+            raise ValueError("distillation inputs must have matching [B, D, T] shapes")
+        similarity = super().forward(x, y)
+        if similarity.shape != (x.shape[0], x.shape[2]):
+            raise ValueError("cosine distillation must reduce the hidden dimension")
+        loss = similarity.sum() * self.scale
         if self.finegrained_reduction == 'mean':
-            loss = loss / (b * t)
+            loss = loss / similarity.numel()
         elif self.finegrained_reduction == 'sum':
             loss = loss
         elif self.finegrained_reduction == 'mean_batch':
-            loss = loss / b
+            loss = loss / x.shape[0]
         else:
             raise ValueError(f"Invalid reduction: {self.finegrained_reduction}")
         return loss
