@@ -179,7 +179,7 @@ StreamingASR/
 │   ├── hybrid_distil_ctc.yaml      # Distillation config
 │   └── hybrid_transducer_ctc.yaml  # RNN-T training config
 ├── ckpt_conversion/
-│   ├── convert_hf_to_nemo.py       # HF Whisper/Qwen → NeMo
+│   ├── convert_hf_to_nemo.py       # HF Whisper → distillation init
 │   ├── convert_distill_to_rnnt.py  # Distill → RNN-T format
 │   └── verify_checkpoint.py        # Verify conversion
 ├── src/
