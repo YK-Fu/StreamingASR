@@ -18,9 +18,8 @@ import gc
 from typing import Dict, Optional
 
 import torch
-import torch.nn as nn
 from lightning.pytorch import Trainer
-from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from nemo.collections.asr.models.asr_model import ASRModel
 from nemo.collections.asr.models.hybrid_rnnt_ctc_models import EncDecHybridRNNTCTCModel
@@ -31,6 +30,8 @@ from nemo.core.classes.mixins import AccessMixin
 
 from src.loss import CTCLoss, NLLLoss
 from src.decoding_utils import CTCDecoding, RNNTDecoding, WER
+from src.ctc_pruning import reduce_ctc_frames
+from src.modules.projection import CausalLConv
 from src.modules.transformer_decoder import DecoderRuntime
 from src.datasets import get_asr_dataset, ResumableDataloader, ResumableSampler
 from src.token_augmentation import (
@@ -208,16 +209,24 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             blank_id=self.blank_id,
         )
 
+        # One mode for periodic training diagnostics. Validation can override
+        # this per dataloader through validation_use_cer.
+        legacy_training_use_cer = self.cfg.get(
+            'use_cer', self.cfg.get('aux_ctc', {}).get('use_cer', False)
+        )
+        self.training_use_cer = bool(
+            self.cfg.get('training_use_cer', legacy_training_use_cer)
+        )
+
         # Setup wer object
         self.wer = WER(
             decoding=self.decoding,
             batch_dim_index=0,
-            use_cer=self.cfg.get('use_cer', False),
+            use_cer=self.training_use_cer,
             log_prediction=self.cfg.get('log_prediction', True),
             dist_sync_on_step=False,
+            sync_on_compute=False,
         )
-
-        self.joint.set_wer(self.wer)
 
         # setup auxiliary CTC decoder
         if 'aux_ctc' not in self.cfg:
@@ -254,9 +263,32 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         # Setup CTC WER
         self.ctc_wer = WER(
             decoding=self.ctc_decoding,
-            use_cer=self.cfg.aux_ctc.get('use_cer', False),
+            use_cer=self.training_use_cer,
             dist_sync_on_step=False,
+            sync_on_compute=False,
             log_prediction=self.cfg.get("log_prediction", False),
+        )
+
+        frame_cfg = self.cfg.get("ctc_pruning", {}).get("frame", {})
+        self.frame_pruning_enabled = bool(frame_cfg.get("enabled", True))
+        self.frame_blank_threshold = float(
+            frame_cfg.get("blank_threshold", 0.95)
+        )
+        if not 0.0 <= self.frame_blank_threshold <= 1.0:
+            raise ValueError(
+                "ctc_pruning.frame.blank_threshold must be in [0, 1]"
+            )
+        self.lconv = CausalLConv(
+            channels=int(self.cfg.encoder.d_model),
+            kernel_size=int(frame_cfg.get("lconv_kernel_size", 7)),
+            expansion=int(frame_cfg.get("lconv_expansion", 2)),
+        )
+        if not self.frame_pruning_enabled:
+            self.lconv.requires_grad_(False)
+        logging.info(
+            "CTC frame pruning configured: "
+            f"enabled={self.frame_pruning_enabled}, "
+            f"blank_threshold={self.frame_blank_threshold}"
         )
         # Setup optimization normalization (if provided in config)
         self.setup_optim_normalization()
@@ -283,7 +315,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             audio_chunk_size=config.get('audio_chunk_size', None),
             audio_chunk_step=config.get('audio_chunk_step', None),
             bucket_by=config.get('bucket_by', 'audio'),
-            drop_last=config.get('drop_last', True),
+            drop_last=config.get('drop_last', False),
             text_bucket_size=config.get('text_bucket_size', None),
             max_context_tokens=config.get('max_context_tokens', None),
             augmentation=config.get('augmentation', None),
@@ -346,6 +378,60 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         progress = min(max(step / ramp_steps, 0.0), 1.0)
         return 1.0 - 0.5 * progress, progress
 
+    def _prepare_rnnt_frames(
+        self,
+        encoded: torch.Tensor,
+        encoded_len: torch.Tensor,
+        ctc_output: Optional[torch.Tensor],
+        target_lengths: Optional[torch.Tensor],
+    ):
+        """Apply causal LConv and compact frames using CTC blank posteriors."""
+        if not self.frame_pruning_enabled:
+            frame_count = encoded_len.sum()
+            return encoded, encoded_len, frame_count, frame_count
+        if ctc_output is None:
+            raise ValueError("CTC output is required when frame pruning is enabled")
+
+        reduced = reduce_ctc_frames(
+            encoded=self.lconv(encoded),
+            ctc_log_probs=ctc_output,
+            input_lengths=encoded_len,
+            target_lengths=target_lengths,
+            blank_id=self.blank_id,
+            blank_threshold=self.frame_blank_threshold,
+        )
+        return (
+            reduced.encoded,
+            reduced.lengths,
+            reduced.retained_frames,
+            reduced.valid_frames,
+        )
+
+    @torch.no_grad()
+    def _compute_rnnt_wer(
+        self,
+        encoded: torch.Tensor,
+        encoded_lengths: torch.Tensor,
+        context: torch.Tensor,
+        targets: torch.Tensor,
+        target_start: torch.Tensor,
+        target_end: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode one prompt-padded batch and return local exact error counts."""
+        self.wer.reset()
+        try:
+            self.wer.update(
+                predictions=encoded.detach(),
+                predictions_lengths=encoded_lengths,
+                targets=targets.detach(),
+                targets_lengths=target_end - target_start,
+                input_ids=context,
+                input_ids_lengths=target_start,
+            )
+            return self.wer.compute()
+        finally:
+            self.wer.reset()
+
     def change_decoding_strategy(
         self, decoding_cfg: DictConfig = None, decoder_type: str = None, verbose: bool = True
     ):
@@ -379,9 +465,8 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                 use_cer=self.wer.use_cer,
                 log_prediction=self.wer.log_prediction,
                 dist_sync_on_step=False,
+                sync_on_compute=False,
             )
-
-            self.joint.set_wer(self.wer)
 
             self.joint.temperature = decoding_cfg.get('temperature', 1.0)
 
@@ -410,6 +495,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                 use_cer=self.ctc_wer.use_cer,
                 log_prediction=self.ctc_wer.log_prediction,
                 dist_sync_on_step=False,
+                sync_on_compute=False,
             )
 
             self.ctc_decoder.temperature = decoding_cfg.get('temperature', 1.0)
@@ -458,14 +544,32 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         # forward() only performs encoder forward
         encoded = self.forward(input_signal=signal, language_ids=language_ids)
         encoded_len = torch.full((encoded.shape[0],), encoded.shape[2], device=encoded.device)
+        target_lengths = target_end - target_start
 
-        # simple_am for the smoothed RNN-T loss now comes from its own projection.
-        simple_am = self.simple_am_proj(encoded, return_logits=True, return_softmax=False)
+        ctc_output = None
         if (
             self.ctc_loss_weight > 0
             or self.ctc_history_enabled
+            or self.frame_pruning_enabled
         ):
             ctc_output = self.ctc_decoder(encoded, return_logits=False, return_softmax=True)
+
+        (
+            rnnt_encoded,
+            rnnt_encoded_len,
+            retained_frames,
+            valid_frames,
+        ) = self._prepare_rnnt_frames(
+            encoded=encoded,
+            encoded_len=encoded_len,
+            ctc_output=ctc_output,
+            target_lengths=target_lengths,
+        )
+        # The simple AM estimates pruning ranges on the same reduced time axis
+        # consumed by the final RNN-T joint.
+        simple_am = self.simple_am_proj(
+            rnnt_encoded, return_logits=True, return_softmax=False
+        )
 
         ctc_history_effective_ratio = self._ctc_history_ratio_at_step(
             self.trainer.global_step
@@ -583,8 +687,8 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         )
 
         # Fused joint step
-        simple_loss, rnnt_loss, wer, _, _ = self.joint.forward_fused_loss(
-            encoder_outputs=encoded,
+        simple_loss, rnnt_loss = self.joint.forward_fused_loss(
+            encoder_outputs=rnnt_encoded,
             decoder_outputs=decoded,
             simple_am=simple_am,
             simple_lm=simple_lm,
@@ -592,14 +696,24 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             lm_only_scale=self.cfg.loss.get("lm_only_scale", 0.25),
             s_range=self.cfg.loss.get("s_range", 5),
             delay_penalty=delay_penalty,
+            fastemit_lambda=self.cfg.loss.get("fastemit_lambda", 0.0),
             blank_symbol=self.blank_id,
-            encoder_lengths=encoded_len,
+            encoder_lengths=rnnt_encoded_len,
             transcripts=context,
             targets=target,
             target_start=target_start,
             target_end=target_end,
-            compute_wer=compute_wer,
         )
+
+        if compute_wer:
+            wer, _, _ = self._compute_rnnt_wer(
+                encoded=rnnt_encoded,
+                encoded_lengths=rnnt_encoded_len,
+                context=context,
+                targets=target,
+                target_start=target_start,
+                target_end=target_end,
+            )
 
         # Add auxiliary losses, if registered
         rnnt_loss = self.add_auxiliary_losses(rnnt_loss)
@@ -653,6 +767,11 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             "train_rnnt_loss_weight": context.new_tensor(
                 rnnt_loss_weight, dtype=torch.float
             ),
+            "train_rnnt_retained_frames": retained_frames.detach(),
+            "train_rnnt_valid_frames": valid_frames.detach(),
+            "train_rnnt_frame_retention_rate": (
+                retained_frames.float() / valid_frames.clamp(min=1)
+            ).detach(),
         })
         if self.context_deletion_enabled:
             tensorboard_logs.update({
@@ -666,10 +785,13 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             tensorboard_logs.update({'train_llm_loss': llm_loss.detach()})
 
         if compute_wer:
-            tensorboard_logs.update({'training_batch_wer': wer.detach()})
+            tensorboard_logs.update({'training_batch_error_rate': wer.detach()})
         if self.ctc_loss_weight > 0:
             ctc_loss = self.ctc_loss(
-                log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_end - target_start
+                log_probs=ctc_output,
+                targets=target,
+                input_lengths=encoded_len,
+                target_lengths=target_lengths,
             )
             tensorboard_logs.update({'train_ctc_loss': ctc_loss.detach()})
             loss_value = (1 - self.ctc_loss_weight - self.llm_loss_weight) * (simple_loss_weight * simple_loss + rnnt_loss_weight * rnnt_loss) + self.ctc_loss_weight * ctc_loss + self.llm_loss_weight * llm_loss
@@ -678,16 +800,16 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
                     predictions=ctc_output, 
                     predictions_lengths=encoded_len,
                     targets=target, 
-                    targets_lengths=target_end - target_start,
+                    targets_lengths=target_lengths,
                 )
                 ctc_wer, _, _ = self.ctc_wer.compute()
                 self.ctc_wer.reset()
-                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer.detach()})
+                tensorboard_logs.update({'training_batch_error_rate_ctc': ctc_wer.detach()})
         else:
             loss_value = (1 - self.llm_loss_weight) * (simple_loss_weight * simple_loss + rnnt_loss_weight * rnnt_loss) + self.llm_loss_weight * llm_loss
 
         loss_value, additional_logs = self.add_interctc_losses(
-            loss_value, target, target_end - target_start, compute_wer=compute_wer
+            loss_value, target, target_lengths, compute_wer=compute_wer
         )
 
         tensorboard_logs.update({'train_loss': loss_value.detach()})
@@ -706,6 +828,31 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         else:
             encoded = self.encoder(audio_signal=input_signal, language_ids=language_ids)
         return encoded
+
+    @torch.no_grad()
+    def _transcribe_forward(self, batch, trcfg):
+        """Apply the same CTC-guided frame reduction used by RNN-T training."""
+        del trcfg
+        signal, _ = self.preprocessor(raw_speech=batch[0], length=batch[1])
+        encoded = self.forward(input_signal=signal, language_ids=None)
+        encoded_len = torch.full(
+            (encoded.shape[0],),
+            encoded.shape[2],
+            dtype=torch.long,
+            device=encoded.device,
+        )
+        ctc_output = self.ctc_decoder(
+            encoded, return_logits=False, return_softmax=True
+        )
+        if self.cur_decoder == "ctc":
+            return {"logits": ctc_output, "encoded_len": encoded_len}
+        rnnt_encoded, rnnt_len, _, _ = self._prepare_rnnt_frames(
+            encoded=encoded,
+            encoded_len=encoded_len,
+            ctc_output=ctc_output,
+            target_lengths=None,
+        )
+        return {"encoded": rnnt_encoded, "encoded_len": rnnt_len}
 
     def train(self, mode: bool = True):
         # Lightning calls model.train() on every train epoch, which propagates to all
@@ -735,38 +882,64 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         signal, _ = self.preprocessor(raw_speech=signal, length=None)
         encoded = self.forward(input_signal=signal, language_ids=language_ids)
         encoded_len = torch.full((encoded.shape[0],), encoded.shape[2], device=encoded.device)
+        target_lengths = target_end - target_start
 
         tensorboard_logs = {}
+        ctc_output = self.ctc_decoder(
+            encoded, return_logits=False, return_softmax=True
+        )
+        (
+            rnnt_encoded,
+            rnnt_encoded_len,
+            retained_frames,
+            valid_frames,
+        ) = self._prepare_rnnt_frames(
+            encoded=encoded,
+            encoded_len=encoded_len,
+            ctc_output=ctc_output,
+            target_lengths=target_lengths if self.compute_eval_loss else None,
+        )
 
         if self.compute_eval_loss:
-            simple_am = self.simple_am_proj(encoded, return_logits=True, return_softmax=False)
-            ctc_output = self.ctc_decoder(encoded, return_logits=False, return_softmax=True)
+            simple_am = self.simple_am_proj(
+                rnnt_encoded, return_logits=True, return_softmax=False
+            )
             decoded, _ = self.decoder(input_ids=context[..., :-1], attn_mask=attn_mask)
             simple_lm = self.simple_lm_proj(decoded, return_logits=True, return_softmax=False)
             ctc_loss = self.ctc_loss(
-                log_probs=ctc_output, targets=target, input_lengths=encoded_len, target_lengths=target_end - target_start
+                log_probs=ctc_output,
+                targets=target,
+                input_lengths=encoded_len,
+                target_lengths=target_lengths,
             )
             tensorboard_logs['val_ctc_loss'] = ctc_loss.detach()
         else:
-            ctc_output = self.ctc_decoder(encoded, return_logits=False, return_softmax=True)
             decoded = None
             simple_am = None
             simple_lm = None
 
-        simple_loss, rnnt_loss, wer, wer_num, wer_denom = self.joint.forward_fused_loss(
-            encoder_outputs=encoded,
+        simple_loss, rnnt_loss = self.joint.forward_fused_loss(
+            encoder_outputs=rnnt_encoded,
             decoder_outputs=decoded,
             simple_am=simple_am,
             simple_lm=simple_lm,
             am_only_scale=self.cfg.loss.get("am_only_scale", 0.0),
             lm_only_scale=self.cfg.loss.get("lm_only_scale", 0.25),
             s_range=self.cfg.loss.get("s_range", 5),
-            encoder_lengths=encoded_len,
+            fastemit_lambda=self.cfg.loss.get("fastemit_lambda", 0.0),
+            encoder_lengths=rnnt_encoded_len,
             transcripts=context,
             targets=target,
             target_start=target_start,
             target_end=target_end,
-            compute_wer=True,
+        )
+        wer, wer_num, wer_denom = self._compute_rnnt_wer(
+            encoded=rnnt_encoded,
+            encoded_lengths=rnnt_encoded_len,
+            context=context,
+            targets=target,
+            target_start=target_start,
+            target_end=target_end,
         )
 
         if simple_loss is not None:
@@ -778,6 +951,10 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             tensorboard_logs['val_ctc_loss'] = ctc_loss.detach()
             tensorboard_logs['val_loss'] = ((1 - self.ctc_loss_weight) * (simple_loss_weight * simple_loss + rnnt_loss_weight * rnnt_loss) + self.ctc_loss_weight * ctc_loss).detach()
 
+        tensorboard_logs['val_rnnt_frame_retention_rate'] = (
+            retained_frames.float() / valid_frames.clamp(min=1)
+        ).detach()
+
         tensorboard_logs['val_wer_num'] = wer_num.detach()
         tensorboard_logs['val_wer_denom'] = wer_denom.detach()
         tensorboard_logs['val_wer'] = wer.detach()
@@ -785,7 +962,7 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         self.ctc_wer.update(
             predictions=ctc_output,
             targets=target,
-            targets_lengths=target_end - target_start,
+            targets_lengths=target_lengths,
             predictions_lengths=encoded_len,
         )
         ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
@@ -813,53 +990,95 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
             self.validation_step_outputs.append(logs)
         return logs
 
+    def _global_validation_counts(self, grouped_outputs):
+        """Sum local error counts, then perform one exact distributed reduction."""
+        zero = next(self.parameters()).new_zeros((), dtype=torch.float32)
+        rows = []
+        count_keys = (
+            'val_wer_num',
+            'val_wer_denom',
+            'val_wer_num_ctc',
+            'val_wer_denom_ctc',
+        )
+        for dl_outputs in grouped_outputs:
+            rows.append(
+                torch.stack(
+                    [
+                        sum(
+                            (output[key].float() for output in dl_outputs),
+                            zero.clone(),
+                        )
+                        for key in count_keys
+                    ]
+                )
+            )
+        counts = torch.stack(rows)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        return counts
+
     def on_validation_epoch_end(self):
         outputs = self.validation_step_outputs
         if not outputs:
             super().on_validation_epoch_end()
             return
 
-        if isinstance(outputs[0], list):
-            # Per-dataloader WER for wandb
-            validation_names = list(self.cfg.get('validation_names', []))
-            validation_use_cer = list(self.cfg.get('validation_use_cer', []))
-            rnnt_error_rates = []
-            ctc_error_rates = []
-            for i, dl_outputs in enumerate(outputs):
-                if not dl_outputs:
-                    continue
-                dl_wer_num = sum(o['val_wer_num'] for o in dl_outputs)
-                dl_wer_denom = sum(o['val_wer_denom'] for o in dl_outputs)
-                dl_ctc_num = sum(o['val_wer_num_ctc'] for o in dl_outputs)
-                dl_ctc_denom = sum(o['val_wer_denom_ctc'] for o in dl_outputs)
-                rnnt_rate = dl_wer_num / dl_wer_denom if dl_wer_denom > 0 else dl_wer_num.new_zeros(())
-                ctc_rate = dl_ctc_num / dl_ctc_denom if dl_ctc_denom > 0 else dl_ctc_num.new_zeros(())
-                rnnt_error_rates.append(rnnt_rate)
-                ctc_error_rates.append(ctc_rate)
-                self.log(f'val_wer_dl{i}', rnnt_rate, sync_dist=True)
-                self.log(f'val_wer_ctc_dl{i}', ctc_rate, sync_dist=True)
+        is_multi_dataloader = isinstance(outputs[0], list)
+        grouped_outputs = outputs if is_multi_dataloader else [list(outputs)]
+        all_outputs = [output for group in grouped_outputs for output in group]
+        counts = self._global_validation_counts(grouped_outputs)
 
+        validation_names = list(self.cfg.get('validation_names', []))
+        validation_use_cer = list(self.cfg.get('validation_use_cer', []))
+        rnnt_error_rates = []
+        ctc_error_rates = []
+        for i, (rnnt_num, rnnt_denom, ctc_num, ctc_denom) in enumerate(counts):
+            rnnt_rate = torch.where(
+                rnnt_denom > 0, rnnt_num / rnnt_denom, torch.zeros_like(rnnt_num)
+            )
+            ctc_rate = torch.where(
+                ctc_denom > 0, ctc_num / ctc_denom, torch.zeros_like(ctc_num)
+            )
+            rnnt_error_rates.append(rnnt_rate)
+            ctc_error_rates.append(ctc_rate)
+
+            if is_multi_dataloader:
+                self.log(f'val_wer_dl{i}', rnnt_rate, sync_dist=False)
+                self.log(f'val_wer_ctc_dl{i}', ctc_rate, sync_dist=False)
                 if i < len(validation_names) and i < len(validation_use_cer):
                     metric = 'cer' if validation_use_cer[i] else 'wer'
                     name = validation_names[i]
-                    self.log(f'val_{metric}_{name}', rnnt_rate, sync_dist=True)
-                    self.log(f'val_{metric}_{name}_ctc', ctc_rate, sync_dist=True)
+                    self.log(f'val_{metric}_{name}', rnnt_rate, sync_dist=False)
+                    self.log(f'val_{metric}_{name}_ctc', ctc_rate, sync_dist=False)
 
-            if rnnt_error_rates:
-                self.log('val_error_rate_macro', torch.stack(rnnt_error_rates).mean(), sync_dist=True)
-                self.log('val_error_rate_macro_ctc', torch.stack(ctc_error_rates).mean(), sync_dist=True)
-            all_outputs = [o for dl in outputs for o in dl]
-        else:
-            all_outputs = list(outputs)
+        if is_multi_dataloader and rnnt_error_rates:
+            self.log(
+                'val_error_rate_macro',
+                torch.stack(rnnt_error_rates).mean(),
+                sync_dist=False,
+            )
+            self.log(
+                'val_error_rate_macro_ctc',
+                torch.stack(ctc_error_rates).mean(),
+                sync_dist=False,
+            )
 
         if all_outputs:
-            # Exact global WER using accumulated num/denom
-            total_wer_num = sum(o['val_wer_num'] for o in all_outputs)
-            total_wer_denom = sum(o['val_wer_denom'] for o in all_outputs)
-            total_ctc_num = sum(o['val_wer_num_ctc'] for o in all_outputs)
-            total_ctc_denom = sum(o['val_wer_denom_ctc'] for o in all_outputs)
-            self.log('val_wer', total_wer_num / total_wer_denom if total_wer_denom > 0 else 0.0, sync_dist=True)
-            self.log('val_wer_ctc', total_ctc_num / total_ctc_denom if total_ctc_denom > 0 else 0.0, sync_dist=True)
+            total_wer_num, total_wer_denom, total_ctc_num, total_ctc_denom = (
+                counts.sum(dim=0)
+            )
+            total_wer = torch.where(
+                total_wer_denom > 0,
+                total_wer_num / total_wer_denom,
+                torch.zeros_like(total_wer_num),
+            )
+            total_ctc_wer = torch.where(
+                total_ctc_denom > 0,
+                total_ctc_num / total_ctc_denom,
+                torch.zeros_like(total_ctc_num),
+            )
+            self.log('val_wer', total_wer, sync_dist=False)
+            self.log('val_wer_ctc', total_ctc_wer, sync_dist=False)
             # Macro avg for all other metrics
             skip = {'val_wer', 'val_wer_ctc', 'val_wer_num', 'val_wer_denom', 'val_wer_num_ctc', 'val_wer_denom_ctc'}
             for key in [k for k in all_outputs[0] if k not in skip]:
@@ -872,10 +1091,9 @@ class HybridRNNTCTCWhisperLMModel(EncDecHybridRNNTCTCModel, ASRBPEMixin, InterCT
         # sublists on next epoch (in-place clear() would leave a flat []).
         self._validation_step_outputs = None
         super().on_validation_epoch_end()
-        # Validation ends with the English dataloader (WER). Restore the default
-        # training metrics so periodic training logs retain their configured mode.
-        self.wer.use_cer = self.cfg.get('use_cer', False)
-        self.ctc_wer.use_cer = self.cfg.aux_ctc.get('use_cer', False)
+        # Restore the training metric mode after per-dataloader validation overrides.
+        self.wer.use_cer = self.training_use_cer
+        self.ctc_wer.use_cer = self.training_use_cer
         torch.cuda.empty_cache()
         gc.collect()
 

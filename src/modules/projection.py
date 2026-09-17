@@ -6,8 +6,13 @@ from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.module import NeuralModule
 from nemo.collections.asr.parts.submodules.jasper import init_weights
 from nemo.utils import logging
+
 try:
     import k2
+    from src.loss import (
+        rnnt_loss_pruned as fastemit_rnnt_loss_pruned,
+        rnnt_loss_smoothed as fastemit_rnnt_loss_smoothed,
+    )
 except ImportError:
     logging.warning("k2 is not installed, RNN-T training will be disabled")
 
@@ -26,6 +31,40 @@ def _make_activation(name):
     if name not in _ACTIVATIONS:
         raise ValueError(f"Unsupported activation: {name}. Choose from {sorted(_ACTIVATIONS)}")
     return _ACTIVATIONS[name]()
+
+
+class CausalLConv(torch.nn.Module):
+    """Checkpoint-safe causal local-convolution projection.
+
+    The module follows the LConv structure used for frame reduction: a
+    pointwise expansion, depthwise causal convolution, and pointwise output
+    projection. The zero-initialized output projection makes the residual block
+    an exact identity when it is first added to an existing checkpoint.
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 7, expansion: int = 2):
+        super().__init__()
+        if channels < 1 or kernel_size < 1 or expansion < 1:
+            raise ValueError("channels, kernel_size, and expansion must be positive")
+        hidden = channels * expansion
+        self.left_padding = kernel_size - 1
+        self.in_proj = torch.nn.Conv1d(channels, hidden, kernel_size=1)
+        self.depthwise = torch.nn.Conv1d(
+            hidden, hidden, kernel_size=kernel_size, groups=hidden
+        )
+        self.out_proj = torch.nn.Conv1d(hidden, channels, kernel_size=1)
+        self.activation = torch.nn.SiLU()
+        torch.nn.init.zeros_(self.out_proj.weight)
+        torch.nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError("LConv input must have shape [batch, channels, time]")
+        residual = x
+        x = self.activation(self.in_proj(x))
+        x = torch.nn.functional.pad(x, (self.left_padding, 0))
+        x = self.activation(self.depthwise(x))
+        return residual + self.out_proj(x)
 
 
 class ProjHead(NeuralModule, Exportable):
@@ -216,13 +255,13 @@ class PrunedRNNTJoint(RNNTJoint):
         lm_only_scale: float = 0.25,
         s_range: int = 5,
         delay_penalty: float = 0.0,
+        fastemit_lambda: float = 0.0,
         blank_symbol: int = 0,
         encoder_lengths: Optional[torch.Tensor] = None,
         transcripts: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
         target_start: Optional[torch.Tensor] = None,
         target_end: Optional[torch.Tensor] = None,
-        compute_wer: bool = False,
     ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
         # encoder = (B, D, T)
         # decoder = (B, D, U) if passed, else None
@@ -242,10 +281,6 @@ class PrunedRNNTJoint(RNNTJoint):
             return out
 
         else:
-            # At least the loss module must be supplied during fused joint
-            if self._wer is None:
-                raise ValueError("`fuse_loss_wer` flag is set, but `wer` modules were not provided! ")
-
             # When using fused joint step, both encoder and transcript lengths must be provided
             if (encoder_lengths is None) or (targets is None) or (target_start is None) or (target_end is None):
                 raise ValueError(
@@ -282,7 +317,7 @@ class PrunedRNNTJoint(RNNTJoint):
                 # fp32-cast inputs — autocast can still affect internal ops. Disable
                 # autocast around k2 calls (matches icefall's torch_autocast guard).
                 with torch.amp.autocast(device_type='cuda', enabled=False):
-                    simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
+                    simple_loss, (px_grad, py_grad) = fastemit_rnnt_loss_smoothed(
                         lm=simple_lm.float(),
                         am=simple_am.float(),
                         symbols=symbols,
@@ -290,6 +325,7 @@ class PrunedRNNTJoint(RNNTJoint):
                         lm_only_scale=lm_only_scale,
                         am_only_scale=am_only_scale,
                         delay_penalty=delay_penalty,
+                        fastemit_lambda=fastemit_lambda,
                         boundary=boundary,
                         reduction='none',
                         return_grad=True,
@@ -309,13 +345,14 @@ class PrunedRNNTJoint(RNNTJoint):
                 )
                 joint = self.forward(enc_pruned, dec_pruned, project_input=False)
                 with torch.amp.autocast(device_type='cuda', enabled=False):
-                    rnnt_loss = k2.rnnt_loss_pruned(
+                    rnnt_loss = fastemit_rnnt_loss_pruned(
                         logits=joint.float(),
                         symbols=symbols,
                         ranges=ranges,
                         termination_symbol=blank_symbol,
                         boundary=boundary,
                         delay_penalty=delay_penalty,
+                        fastemit_lambda=fastemit_lambda,
                         reduction='none',
                     )
                 del joint, ranges, boundary
@@ -346,56 +383,4 @@ class PrunedRNNTJoint(RNNTJoint):
                 simple_loss = None
                 rnnt_loss = None
 
-            # Update WER for sub batch
-            if compute_wer:
-                encoder_outputs = encoder_outputs.transpose(1, 2)  # [B, T, D] -> [B, D, T]
-                encoder_outputs = encoder_outputs.detach()
-                targets = targets.detach()
-
-                # Update WER on each process without syncing
-                if self.training:
-                    original_sync = self.wer._to_sync
-                    self.wer._to_sync = False
-
-                # The predictor is trained on [BOS, language, manifest context].
-                # StaticCache has one cache-position sequence per decode call, so
-                # mixed prompt lengths must be dispatched one utterance at a time.
-                # This validation-only path retains each sample's actual context;
-                # training WER keeps its existing batched fast path.
-                if self.training:
-                    prompt_len = int(target_start.min().item())
-                    prompt_ids = transcripts[:, :prompt_len] if prompt_len > 0 else None
-                    if prompt_ids is not None:
-                        prompt_ids = self.wer.decoding.prepare_prompt(prompt_ids)
-                    self.wer.update(
-                        predictions=encoder_outputs,
-                        predictions_lengths=encoder_lengths,
-                        targets=targets,
-                        targets_lengths=target_end - target_start,
-                        input_ids=prompt_ids,
-                    )
-                else:
-                    for sample_idx in range(encoder_outputs.shape[0]):
-                        prompt_end = int(target_start[sample_idx].item())
-                        prompt_ids = self.wer.decoding.prepare_prompt(
-                            transcripts[sample_idx : sample_idx + 1, :prompt_end]
-                        )
-                        self.wer.update(
-                            predictions=encoder_outputs[sample_idx : sample_idx + 1],
-                            predictions_lengths=encoder_lengths[sample_idx : sample_idx + 1],
-                            targets=targets[sample_idx : sample_idx + 1],
-                            targets_lengths=(target_end - target_start)[sample_idx : sample_idx + 1],
-                            input_ids=prompt_ids,
-                        )
-                # Sync and all_reduce on all processes, compute global WER
-                wer, wer_num, wer_denom = self.wer.compute()
-                self.wer.reset()
-
-                if self.training:
-                    self.wer._to_sync = original_sync
-            else:
-                wer = None
-                wer_num = None
-                wer_denom = None
-
-            return simple_loss, rnnt_loss, wer, wer_num, wer_denom
+            return simple_loss, rnnt_loss
