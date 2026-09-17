@@ -101,7 +101,36 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             self.distil_projector = None
 
         loss_type = self.cfg.distil_loss.get('type', 'cosine')
-        self.distil_loss_scale = self.cfg.distil_loss.get('scale', 10.0)
+        self.distil_loss_scale = float(self.cfg.distil_loss.get('scale', 10.0))
+        self.distil_scale_schedule = str(
+            self.cfg.distil_loss.get('scale_schedule', 'constant')
+        ).lower()
+        if self.distil_scale_schedule == 'constant':
+            self.distil_final_scale = self.distil_loss_scale
+            self.distil_decay_start_step = None
+            self.distil_decay_end_step = None
+        elif self.distil_scale_schedule == 'linear_decay':
+            decay_start = self.cfg.distil_loss.get('decay_start_step', None)
+            decay_end = self.cfg.distil_loss.get('decay_end_step', None)
+            if decay_start is None or decay_end is None:
+                raise ValueError(
+                    "linear_decay requires distil_loss.decay_start_step and "
+                    "distil_loss.decay_end_step"
+                )
+            self.distil_final_scale = float(
+                self.cfg.distil_loss.get('final_scale', 0.0)
+            )
+            self.distil_decay_start_step = int(decay_start)
+            self.distil_decay_end_step = int(decay_end)
+            if self.distil_decay_end_step <= self.distil_decay_start_step:
+                raise ValueError(
+                    "distil_loss.decay_end_step must be greater than decay_start_step"
+                )
+        else:
+            raise ValueError(
+                "distil_loss.scale_schedule must be 'constant' or 'linear_decay', "
+                f"got {self.distil_scale_schedule!r}"
+            )
         if loss_type == 'cosine':
             self.distil_loss = CosineSimilarityLoss(dim=-1, scale=self.distil_loss_scale, reduction=self.cfg.distil_loss.get('reduction', 'mean'))
         elif loss_type == 'mse':
@@ -146,10 +175,19 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
 
         self.ctc_decoding = CTCDecoding(self.cfg.aux_ctc.decoding, tokenizer=self.tokenizer, blank_id=self.blank_id)
 
+        # One mode for periodic training diagnostics. Validation can override
+        # this per dataloader through validation_use_cer. The aux_ctc fallback
+        # keeps older checkpoints restorable.
+        self.training_use_cer = bool(
+            self.cfg.get(
+                'training_use_cer', self.cfg.aux_ctc.get('use_cer', False)
+            )
+        )
+
         # Setup CTC WER
         self.ctc_wer = WER(
             decoding=self.ctc_decoding,
-            use_cer=self.cfg.aux_ctc.get('use_cer', False),
+            use_cer=self.training_use_cer,
             dist_sync_on_step=False,
             log_prediction=self.cfg.get("log_prediction", False),
         )
@@ -158,6 +196,76 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         self.setup_optimization_flags()
 
         self.setup_interctc(decoder_name='ctc_decoder', loss_name='ctc_loss', wer_name='ctc_wer')
+
+    def get_distil_scale(self, step: Optional[int] = None) -> float:
+        """Return the effective distillation scale at an optimizer step."""
+
+        if self.distil_scale_schedule == 'constant':
+            return self.distil_loss_scale
+        if step is None:
+            step = int(self.trainer.global_step)
+        if step <= self.distil_decay_start_step:
+            return self.distil_loss_scale
+        if step >= self.distil_decay_end_step:
+            return self.distil_final_scale
+
+        progress = (step - self.distil_decay_start_step) / (
+            self.distil_decay_end_step - self.distil_decay_start_step
+        )
+        return self.distil_loss_scale + progress * (
+            self.distil_final_scale - self.distil_loss_scale
+        )
+
+    def apply_distil_scale_schedule(self, distil_loss: torch.Tensor, step: Optional[int] = None):
+        """Rescale a loss that was constructed with ``distil_loss_scale``."""
+        effective_scale = self.get_distil_scale(step)
+        if self.distil_loss_scale != 0.0:
+            distil_loss = distil_loss * (effective_scale / self.distil_loss_scale)
+        return distil_loss, effective_scale
+
+    def _compute_distil_loss(
+        self,
+        student_encoded: torch.Tensor,
+        teacher_signal: torch.Tensor,
+        step: Optional[int] = None,
+    ):
+        """Compute distillation only while its effective scheduled scale is nonzero."""
+        effective_scale = self.get_distil_scale(step)
+        if effective_scale == 0.0:
+            distil_loss = student_encoded.new_zeros(())
+
+            # The projector is used only by distillation. Once a scheduled scale reaches
+            # zero, keep its trainable parameters in the graph with zero contribution so
+            # DDP with find_unused_parameters=False still observes their gradient hooks.
+            # This avoids both the projector forward and the much larger teacher forward.
+            if torch.is_grad_enabled() and self.distil_projector is not None:
+                projector_params = [
+                    parameter.reshape(-1)[0]
+                    for parameter in self.distil_projector.parameters()
+                    if parameter.requires_grad and parameter.numel() > 0
+                ]
+                if projector_params:
+                    distil_loss = distil_loss + torch.stack(projector_params).sum() * 0.0
+            return distil_loss, effective_scale
+
+        teacher_encoded = self.forward(input_signal=teacher_signal, mode='teacher')
+
+        # Match the student frame rate to the teacher for the distillation loss only.
+        # The CTC head consumes the original low-rate ``student_encoded``.
+        if self.distil_projector is not None:
+            student_for_distil = self.distil_projector(student_encoded)
+            # Conv floor-rounding can leave the upsampled length a few frames off the
+            # teacher's; align on the shorter length before the elementwise/cosine loss.
+            if student_for_distil.shape[2] != teacher_encoded.shape[2]:
+                length = min(student_for_distil.shape[2], teacher_encoded.shape[2])
+                student_for_distil = student_for_distil[..., :length]
+                teacher_encoded = teacher_encoded[..., :length]
+        else:
+            student_for_distil = student_encoded
+
+        distil_loss = self.distil_loss(student_for_distil, teacher_encoded)
+        distil_loss, effective_scale = self.apply_distil_scale_schedule(distil_loss, step)
+        return distil_loss, effective_scale
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         dataset = get_asr_dataset(
@@ -170,7 +278,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             bucket_by=config.get('bucket_by', 'audio'),
             audio_chunk_size=config.get('audio_chunk_size', None),
             audio_chunk_step=config.get('audio_chunk_step', None),
-            drop_last=config.get('drop_last', True),
+            drop_last=config.get('drop_last', False),
             language_file=config.get('language_file', ""),
             language_drop_rate=config.get('language_drop_rate', 0.0),
             never_drop_language=config.get('never_drop_language', []),
@@ -217,22 +325,10 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
             student_signal = teacher_signal = signal
         # forward() only performs encoder forward
         student_encoded = self.forward(input_signal=student_signal, language_ids=language_id)
-        teacher_encoded = self.forward(input_signal=teacher_signal, mode='teacher')
         encoded_len = torch.full((student_encoded.shape[0],), student_encoded.shape[2], device=student_encoded.device)
-
-        # Match the student frame rate to the teacher for the distillation loss only.
-        # The CTC head below still consumes the low-rate `student_encoded`.
-        if self.distil_projector is not None:
-            student_for_distil = self.distil_projector(student_encoded)
-            # conv floor-rounding can leave the upsampled length a few frames off the
-            # teacher's; align on the shorter length before the elementwise/cosine loss.
-            if student_for_distil.shape[2] != teacher_encoded.shape[2]:
-                L = min(student_for_distil.shape[2], teacher_encoded.shape[2])
-                student_for_distil, teacher_encoded = student_for_distil[..., :L], teacher_encoded[..., :L]
-        else:
-            student_for_distil = student_encoded
-        distil_loss = self.distil_loss(student_for_distil, teacher_encoded)
-        del teacher_encoded, student_for_distil  # free before next large alloc
+        distil_loss, effective_distil_scale = self._compute_distil_loss(
+            student_encoded, teacher_signal
+        )
 
         # NOTE: do NOT reset the access registry here. The interctc layer-15 tensor
         # captured during the student forward must survive until add_interctc_losses()
@@ -242,6 +338,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
 
         tensorboard_logs = {
             'train_distil_loss': distil_loss.detach(),
+            'train_distil_scale': distil_loss.new_tensor(effective_distil_scale),
             'learning_rate': self._optimizer.param_groups[0]['lr'],
             'global_step': self.trainer.global_step,
         }
@@ -273,7 +370,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
                 )
                 ctc_wer, _, _ = self.ctc_wer.compute()
                 self.ctc_wer.reset()
-                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer.detach()})
+                tensorboard_logs.update({'training_batch_error_rate_ctc': ctc_wer.detach()})
         else:
             loss_value = distil_loss
         del ctc_output
@@ -387,7 +484,7 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         torch.cuda.empty_cache()
         gc.collect()
         super().on_validation_epoch_end()
-        self.ctc_wer.use_cer = self.cfg.aux_ctc.get('use_cer', False)
+        self.ctc_wer.use_cer = self.training_use_cer
 
     def on_train_epoch_end(self):
         torch.cuda.empty_cache()
@@ -428,21 +525,12 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         target_len = target_end - target_start
         signal, _ = self.preprocessor(raw_speech=waveform, length=None)
         student_encoded = self.forward(input_signal=signal, language_ids=language_ids)
-        teacher_encoded = self.forward(input_signal=signal, mode='teacher')
         encoded_len = torch.full((student_encoded.shape[0],), student_encoded.shape[2], device=student_encoded.device)
 
         tensorboard_logs = {}
-        # distil_loss already incorporates the scale internally (CosineSimilarityLoss(scale=...))
-        if self.distil_projector is not None:
-            student_for_distil = self.distil_projector(student_encoded)
-            if student_for_distil.shape[2] != teacher_encoded.shape[2]:
-                L = min(student_for_distil.shape[2], teacher_encoded.shape[2])
-                student_for_distil, teacher_encoded = student_for_distil[..., :L], teacher_encoded[..., :L]
-        else:
-            student_for_distil = student_encoded
-        distil_loss = self.distil_loss(student_for_distil, teacher_encoded)
+        distil_loss, effective_distil_scale = self._compute_distil_loss(student_encoded, signal)
         tensorboard_logs['val_distil_loss'] = distil_loss.detach()
-        del teacher_encoded, student_for_distil
+        tensorboard_logs['val_distil_scale'] = distil_loss.new_tensor(effective_distil_scale)
 
         ctc_output = self.ctc_decoder(student_encoded, return_logits=False, return_softmax=True)
         del student_encoded
@@ -550,4 +638,20 @@ class CausalWhisperDistilModel(ASRModel, ASRBPEMixin, InterCTCMixin):
         if 'rng_state' in state_dict:
             torch.set_rng_state(state_dict['rng_state']['torch'])
             torch.cuda.set_rng_state_all(state_dict['rng_state']['cuda'])
+
+        # Lightning restores scheduler attributes from the checkpoint after the
+        # scheduler is constructed. When deliberately extending a run, retain
+        # the new configured horizon rather than silently restoring the old one
+        # (which would make WarmupPolicy drop to min_lr immediately).
+        scheduler_cfg = self.cfg.optim.get('sched', None)
+        configured_max_steps = scheduler_cfg.get('max_steps', None) if scheduler_cfg is not None else None
+        if configured_max_steps is not None:
+            configured_max_steps = int(configured_max_steps)
+            for scheduler_state in state_dict.get('lr_schedulers', []):
+                if 'max_steps' in scheduler_state and scheduler_state['max_steps'] != configured_max_steps:
+                    logging.info(
+                        "Updating restored LR scheduler max_steps from "
+                        f"{scheduler_state['max_steps']} to {configured_max_steps}."
+                    )
+                    scheduler_state['max_steps'] = configured_max_steps
         super().on_load_checkpoint(state_dict)
