@@ -1,6 +1,7 @@
 from typing import Optional, List
 import copy
 
+import editdistance
 import torch
 import torch.nn.functional as F
 from torchmetrics import Metric
@@ -13,6 +14,7 @@ from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, A
 from nemo.collections.asr.parts.utils.asr_confidence_utils import ConfidenceMethodMixin
 from nemo.collections.common.tokenizers.aggregate_tokenizer import DummyTokenizer
 from nemo.collections.asr.metrics.wer import WER as NeMoWER
+from nemo.utils import logging
 
 class WER(NeMoWER):
     full_state_update: bool = True
@@ -36,14 +38,15 @@ class WER(NeMoWER):
 
         self.decode = None
         if isinstance(self.decoding, RNNTDecoding):
-            self.decode = lambda predictions, predictions_lengths, predictions_mask, input_ids: self.decoding.rnnt_decoder_predictions_tensor(
+            self.decode = lambda predictions, predictions_lengths, predictions_mask, input_ids, input_ids_lengths: self.decoding.rnnt_decoder_predictions_tensor(
                 encoder_output=predictions,
                 encoded_lengths=predictions_lengths,
                 fold_consecutive=self.fold_consecutive,
                 input_ids=input_ids,
+                input_ids_lengths=input_ids_lengths,
             )
         elif isinstance(self.decoding, AbstractCTCDecoding):
-            self.decode = lambda predictions, predictions_lengths, predictions_mask, input_ids: self.decoding.ctc_decoder_predictions_tensor(
+            self.decode = lambda predictions, predictions_lengths, predictions_mask, input_ids, input_ids_lengths: self.decoding.ctc_decoder_predictions_tensor(
                 decoder_outputs=predictions,
                 decoder_lengths=predictions_lengths,
                 fold_consecutive=self.fold_consecutive,
@@ -53,6 +56,76 @@ class WER(NeMoWER):
 
         self.add_state("scores", default=torch.tensor(0), dist_reduce_fx='sum', persistent=False)
         self.add_state("words", default=torch.tensor(0), dist_reduce_fx='sum', persistent=False)
+
+    def update(
+        self,
+        predictions: torch.Tensor,
+        predictions_lengths: torch.Tensor,
+        targets: torch.Tensor,
+        targets_lengths: torch.Tensor,
+        predictions_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        input_ids_lengths: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """Decode one batch and replace the local error-count state.
+
+        ``input_ids_lengths`` carries the valid length of each right-padded
+        transformer prompt. NeMo's base WER does not forward prompt lengths to
+        its decoder, so the small override is required for heterogeneous
+        prompts. As in NeMo, callers compute and reset after every batch.
+        """
+        references = []
+        targets_cpu = targets.long().cpu()
+        target_lengths_cpu = targets_lengths.long().cpu()
+        if self.batch_dim_index != 0:
+            dims = list(range(targets_cpu.ndim))
+            targets_cpu = targets_cpu.permute(
+                *([self.batch_dim_index] + dims[: self.batch_dim_index] + dims[self.batch_dim_index + 1 :])
+            )
+
+        with torch.no_grad():
+            for sample_idx in range(targets_cpu.shape[0]):
+                target_length = int(target_lengths_cpu[sample_idx].item())
+                target = targets_cpu[sample_idx, :target_length].tolist()
+                references.append(self.decoding.decode_ids_to_str(target))
+            hypotheses = (
+                self.decode(
+                    predictions,
+                    predictions_lengths,
+                    predictions_mask,
+                    input_ids,
+                    input_ids_lengths,
+                )
+                if predictions.numel() > 0
+                else []
+            )
+
+        if hypotheses and self.log_prediction:
+            logging.info("\n")
+            logging.info(f"WER reference:{references[0]}")
+            logging.info(f"WER predicted:{hypotheses[0].text}")
+
+        words = 0
+        scores = 0
+        for hypothesis, reference in zip(hypotheses, references):
+            if isinstance(hypothesis, list):
+                hypothesis = hypothesis[0]
+            if self.use_cer:
+                hypothesis_units = list(hypothesis.text)
+                reference_units = list(reference)
+            else:
+                hypothesis_units = hypothesis.text.split()
+                reference_units = reference.split()
+            words += len(reference_units)
+            scores += editdistance.eval(hypothesis_units, reference_units)
+
+        self.scores = torch.tensor(
+            scores, device=self.scores.device, dtype=self.scores.dtype
+        )
+        self.words = torch.tensor(
+            words, device=self.words.device, dtype=self.words.dtype
+        )
 
 class CTCDecoding(CTCBPEDecoding):
     def __init__(self, decoding_cfg, tokenizer, blank_id=0):
@@ -82,10 +155,9 @@ class RNNTInfer:
         joint_network,
         bos_idx: int = 0,
         blank_idx: int = 0,
-        max_length: int = 1024,
+        max_length: int = 1024,  # Total decoder-cache budget: prompt + emissions
         prefill_bucket_size: int = 0,
         max_symbols_per_step: int = 10,  # Max symbols per encoder frame (safety)
-        max_symbols: int = 1024,  # Max emitted symbols per hypothesis
         preserve_alignments: bool = False,
         preserve_frame_confidence: bool = False,
         compute_timestamps: bool = False,
@@ -98,7 +170,6 @@ class RNNTInfer:
         self.max_length = max_length
         self.prefill_bucket_size = prefill_bucket_size
         self.max_symbols_per_step = max_symbols_per_step
-        self.max_symbols = max_symbols
         self.compute_timestamps = compute_timestamps
 
     def set_decoder_runtime(self, runtime: DecoderRuntime):
@@ -122,19 +193,29 @@ class RNNTInfer:
             assert batch_size is None or batch_size == input_ids.size(0), "batch_size and input_ids.size(0) must be the same or batch_size is None"
             input_ids = input_ids.to(device)
             assert input_ids.size(1) <= self.max_length, "prompt length must not exceed max_length"
-            # The prompt passed by the WER path ([bos, <language>, ...]) is
-            # unpadded, so all tokens are valid and positions are contiguous.
             if attn_mask is None:
                 attn_mask = torch.ones_like(input_ids, dtype=torch.int32)
+            else:
+                attn_mask = attn_mask.to(device=device, dtype=torch.int32)
             if position_ids is None:
-                position_ids = torch.arange(input_ids.size(1), device=device, dtype=torch.long).unsqueeze(0).expand(input_ids.size(0), -1).contiguous()
-            attn_mask = attn_mask.to(device)
-            position_ids = position_ids.to(device)
+                # Logical positions remain contiguous within each right-padded
+                # prompt even though all samples share physical cache slots.
+                position_ids = attn_mask.long().cumsum(dim=1).sub(1).clamp(min=0)
+            else:
+                position_ids = position_ids.to(device=device, dtype=torch.long)
             assert attn_mask.shape == input_ids.shape
             assert position_ids.shape == input_ids.shape
 
         batch_size = input_ids.size(0)
-        valid_lengths = attn_mask.sum(dim=-1)
+        valid_lengths = attn_mask.sum(dim=-1).long()
+        if torch.any(valid_lengths < 1):
+            raise ValueError("Every decoder prompt must contain at least one token")
+        expected_mask = (
+            torch.arange(input_ids.shape[1], device=device).unsqueeze(0)
+            < valid_lengths.unsqueeze(1)
+        )
+        if not torch.equal(attn_mask.bool(), expected_mask):
+            raise ValueError("Decoder prompts must use contiguous right padding")
         prompt_length = input_ids.size(1)
         prefill_network = base_decoder
         if (
@@ -185,17 +266,11 @@ class RNNTInfer:
             next_attn_mask = F.pad(attn_mask, (0, self.max_length - attn_mask.size(1)), value=0)
         else:
             next_attn_mask = attn_mask
-        # position_ids / cache_position follow the SAME "last consumed token"
-        # convention: both index valid_lengths - 1. The decode loop increments
-        # them by 1 (in the emit block) before the next forward, so the first
-        # generated token lands at the contiguous next position/slot. Using
-        # `position_ids[..., valid_lengths] + 1` here double-counted and left a
-        # phantom one-token gap after the prompt (positions 0,2,3,... vs the
-        # 0,1,2,3,... the decoder sees during training).
+        # ``position_ids`` are per-sample logical positions. ``cache_position``
+        # is a shared physical cursor, so shorter prompts leave masked cache
+        # holes before generated tokens. This is the same mechanism used when
+        # only part of an RNN-T batch emits on a decode iteration.
         next_position_ids = position_ids[torch.arange(batch_size), valid_lengths - 1].unsqueeze(-1)
-        # NOTE: cache_position is a single shared scalar for the whole batch, so
-        # variable-length prompts in one batch are only correct when all
-        # valid_lengths are equal (the default BOS-only start satisfies this).
         next_cache_position = valid_lengths.max().unsqueeze(0) - 1
 
         # Greedy decoding overwrites this one-token placeholder in-place. Clone it:
@@ -249,7 +324,6 @@ class LoopLabelRNNTInfer(RNNTInfer):
             for _ in range(batch_size)
         ]
         symbols_added = torch.zeros(batch_size, dtype=torch.int32, device=encoder_output.device)
-        total_symbols_added = torch.zeros(batch_size, dtype=torch.int32, device=encoder_output.device)
         while b2active.any() and cache_position < self.max_length:
             find_next_token_or_end = torch.zeros(batch_size, dtype=torch.bool)
             while not find_next_token_or_end.all():
@@ -258,12 +332,9 @@ class LoopLabelRNNTInfer(RNNTInfer):
                 token_probs = self.joint_network(encoder_output[torch.arange(batch_size), safe_time, ].unsqueeze(1), dec_out)
                 predictions = torch.argmax(token_probs, dim=-1).reshape(batch_size)
                 # A token is written at cache_position + 1. Do not overrun the
-                # static cache, and enforce both the per-frame and utterance caps.
+                # static cache, and enforce the per-frame emission cap.
                 cache_full = bool((cache_position + 1 >= self.max_length).item())
-                force_blank = (
-                    (symbols_added >= self.max_symbols_per_step)
-                    | (total_symbols_added >= self.max_symbols)
-                )
+                force_blank = symbols_added >= self.max_symbols_per_step
                 if cache_full:
                     force_blank.fill_(True)
                 predictions[force_blank] = self.blank_idx
@@ -290,7 +361,6 @@ class LoopLabelRNNTInfer(RNNTInfer):
                         attn_mask[b, cache_position + 1] = 1
                         position_ids[b, 0] = position_ids[b, 0] + 1
                         symbols_added[b] += 1
-                        total_symbols_added[b] += 1
                         hyps[b].y_sequence.append(predictions[b].item())
                     else:
                         attn_mask[b, cache_position + 1] = 0
@@ -303,7 +373,6 @@ class LoopFrameRNNTInfer(RNNTInfer):
     def decode(self, encoder_output, input_ids=None, attn_mask=None, position_ids=None, cache=None, cache_position=None):
         encoder_output = encoder_output.transpose(1, 2)
         batch_size, max_time, _ = encoder_output.shape
-        device = encoder_output.device
         if cache is None:
             input_ids, dec_out, attn_mask, position_ids, cache, cache_position = self.prefill_decoder_state(input_ids, attn_mask, position_ids, batch_size)
         else:
@@ -320,7 +389,6 @@ class LoopFrameRNNTInfer(RNNTInfer):
             for _ in range(batch_size)
         ]
         symbols_added = torch.zeros(batch_size, dtype=torch.int32, device=encoder_output.device)
-        total_symbols_added = torch.zeros(batch_size, dtype=torch.int32, device=encoder_output.device)
         for t in range(max_time):
             while True:
                 if dec_out is None:
@@ -328,10 +396,7 @@ class LoopFrameRNNTInfer(RNNTInfer):
                 token_probs = self.joint_network(encoder_output[torch.arange(batch_size), t:t+1, :], dec_out)
                 predictions = torch.argmax(token_probs, dim=-1).reshape(batch_size)
                 cache_full = bool((cache_position + 1 >= self.max_length).item())
-                force_blank = (
-                    (symbols_added >= self.max_symbols_per_step)
-                    | (total_symbols_added >= self.max_symbols)
-                )
+                force_blank = symbols_added >= self.max_symbols_per_step
                 if cache_full:
                     force_blank.fill_(True)
                 predictions[force_blank] = self.blank_idx
@@ -348,7 +413,6 @@ class LoopFrameRNNTInfer(RNNTInfer):
                             attn_mask[b, cache_position + 1] = 1
                             position_ids[b, 0] = position_ids[b, 0] + 1
                             symbols_added[b] += 1
-                            total_symbols_added[b] += 1
                             hyps[b].y_sequence.append(predictions[b].item())
                 dec_out = None
                 cache_position = cache_position + 1
@@ -398,22 +462,13 @@ class RNNTDecoding(ConfidenceMethodMixin):
         self.max_length = int(self.cfg.get('max_length', 1024))
         self.prefill_bucket_size = int(self.cfg.get('prefill_bucket_size', 0))
         self.max_symbols_per_step = int(self.cfg.get('max_symbols_per_step', 10))
-        self.max_symbols = int(self.cfg.get('greedy', {}).get('max_symbols', self.max_length))
         if self.max_length < 3:
             raise ValueError("decoding.max_length must reserve BOS, language, and at least one output slot")
-        if self.max_symbols < 1:
-            raise ValueError("decoding.greedy.max_symbols must be positive")
         if self.prefill_bucket_size < 0:
             raise ValueError("decoding.prefill_bucket_size cannot be negative")
-        # Keep half of the configured total output allowance available even for
-        # long manifest context. The remaining slots are prompt history.
-        self.reserved_output_tokens = max(1, self.max_symbols // 2)
-        self.max_prompt_length = self.max_length - self.reserved_output_tokens
-        if self.max_prompt_length < 2:
-            raise ValueError(
-                "decoding.max_length is too small for the output reservation implied by "
-                "decoding.greedy.max_symbols"
-            )
+        # ``max_length`` is the single total-token budget. Limit prompt history
+        # to the first half so at least the other half remains for emissions.
+        self.max_prompt_length = (self.max_length + 1) // 2
         
         # Override decoding strategy instantiation for greedy_batch
         if self.cfg.strategy == "LoopLabel":
@@ -425,7 +480,6 @@ class RNNTDecoding(ConfidenceMethodMixin):
                 max_length=self.max_length,
                 prefill_bucket_size=self.prefill_bucket_size,
                 max_symbols_per_step=self.max_symbols_per_step,
-                max_symbols=self.max_symbols,
                 preserve_alignments=self.preserve_alignments,
                 preserve_frame_confidence=self.preserve_frame_confidence,
                 compute_timestamps=self.compute_timestamps,
@@ -439,7 +493,6 @@ class RNNTDecoding(ConfidenceMethodMixin):
                 max_length=self.max_length,
                 prefill_bucket_size=self.prefill_bucket_size,
                 max_symbols_per_step=self.max_symbols_per_step,
-                max_symbols=self.max_symbols,
                 preserve_alignments=self.preserve_alignments,
                 preserve_frame_confidence=self.preserve_frame_confidence,
                 compute_timestamps=self.compute_timestamps,
@@ -469,6 +522,48 @@ class RNNTDecoding(ConfidenceMethodMixin):
         if history_budget == 0:
             return input_ids[:, :2]
         return torch.cat((input_ids[:, :2], input_ids[:, -history_budget:]), dim=1)
+
+    def prepare_batched_prompts(
+        self,
+        input_ids: torch.Tensor,
+        input_ids_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Truncate and right-pad sample-specific prompts for one decode call."""
+        if input_ids.ndim != 2:
+            raise ValueError("RNN-T prompts must have shape [batch, prompt_length]")
+        batch_size = input_ids.shape[0]
+        if input_ids_lengths.shape != (batch_size,):
+            raise ValueError("input_ids_lengths must have shape [batch]")
+        lengths = input_ids_lengths.to(device=input_ids.device, dtype=torch.long)
+        if torch.any(lengths < 2) or torch.any(lengths > input_ids.shape[1]):
+            raise ValueError(
+                "Every RNN-T prompt must contain BOS and language tokens and fit input_ids"
+            )
+
+        prepared = []
+        for sample_idx, prompt_length in enumerate(lengths.detach().cpu().tolist()):
+            prepared.append(
+                self.prepare_prompt(
+                    input_ids[sample_idx : sample_idx + 1, :prompt_length]
+                ).squeeze(0)
+            )
+
+        prepared_lengths = torch.tensor(
+            [prompt.numel() for prompt in prepared],
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        max_prompt_length = int(prepared_lengths.max().item())
+        padded = input_ids.new_full(
+            (batch_size, max_prompt_length), self.blank_id
+        )
+        for sample_idx, prompt in enumerate(prepared):
+            padded[sample_idx, : prompt.numel()] = prompt
+        attention_mask = (
+            torch.arange(max_prompt_length, device=input_ids.device).unsqueeze(0)
+            < prepared_lengths.unsqueeze(1)
+        ).to(dtype=torch.int32)
+        return padded, attention_mask
 
 
     
@@ -555,12 +650,34 @@ class RNNTDecoding(ConfidenceMethodMixin):
     def compute_rnnt_timestamps(self, hypothesis: rnnt_utils.Hypothesis, timestamp_type: str = 'all'):
         # TODO
         pass
-    def rnnt_decoder_predictions_tensor(self, encoder_output, encoded_lengths, return_hypotheses: bool = False, partial_hypotheses: Optional[List[rnnt_utils.Hypothesis]] = None, input_ids=None, **kwargs):
+    def rnnt_decoder_predictions_tensor(
+        self,
+        encoder_output,
+        encoded_lengths,
+        return_hypotheses: bool = False,
+        partial_hypotheses: Optional[List[rnnt_utils.Hypothesis]] = None,
+        input_ids=None,
+        input_ids_lengths=None,
+        **kwargs,
+    ):
+        del partial_hypotheses, kwargs
         with torch.inference_mode():
             # input_ids is the prompt prefix ([bos, <language>, ...]) that the
             # predictor/joint were trained on; seeding it is required, otherwise
             # the bos-only initial state is out-of-distribution for the joint.
-            hypotheses_list = self.decoding.decode(encoder_output=encoder_output, input_ids=input_ids)  # type: [List[Hypothesis]]
+            prompt_attention_mask = None
+            if input_ids is not None and input_ids_lengths is not None:
+                input_ids, prompt_attention_mask = self.prepare_batched_prompts(
+                    input_ids=input_ids,
+                    input_ids_lengths=input_ids_lengths,
+                )
+            elif input_ids is not None:
+                input_ids = self.prepare_prompt(input_ids)
+            hypotheses_list = self.decoding.decode(
+                encoder_output=encoder_output,
+                input_ids=input_ids,
+                attn_mask=prompt_attention_mask,
+            )  # type: [List[Hypothesis]]
 
             # extract the hypotheses
             hypotheses_list = hypotheses_list[0]  # type: List[Hypothesis]
